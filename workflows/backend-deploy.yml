@@ -1,0 +1,270 @@
+name: Deploy Backend via CodeDeploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: massnexus-prd-backend-artifacts
+  CODEDEPLOY_APP: massnexus-prd-backend
+  CODEDEPLOY_GROUP: massnexus-prd-backend-dg
+
+jobs:
+  deploy:
+    name: Build and Deploy Laravel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, filter, gd, json, redis
+          tools: composer:v2
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist
+
+      - name: Create deployment package
+        run: |
+          # Crear directorio de deployment
+          mkdir -p deploy
+
+          # Copiar archivos necesarios
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='deploy' \
+            --exclude='.env' \
+            --exclude='.env.example' \
+            --exclude='storage/logs/*' \
+            --exclude='storage/framework/cache/*' \
+            --exclude='storage/framework/sessions/*' \
+            --exclude='storage/framework/views/*' \
+            ./ deploy/
+
+          # Crear directorios de storage vacíos
+          mkdir -p deploy/storage/{app,framework,logs}
+          mkdir -p deploy/storage/framework/{cache,sessions,views}
+          mkdir -p deploy/bootstrap/cache
+
+          # Permisos
+          chmod -R 755 deploy/storage
+          chmod -R 755 deploy/bootstrap/cache
+
+      - name: Create appspec.yml
+        run: |
+          cat > deploy/appspec.yml << 'APPSPEC'
+          version: 0.0
+          os: linux
+          files:
+            - source: /
+              destination: /var/www/app
+          hooks:
+            ApplicationStop:
+              - location: scripts/application_stop.sh
+                timeout: 300
+                runas: root
+            BeforeInstall:
+              - location: scripts/before_install.sh
+                timeout: 300
+                runas: root
+            AfterInstall:
+              - location: scripts/after_install.sh
+                timeout: 600
+                runas: root
+            ApplicationStart:
+              - location: scripts/application_start.sh
+                timeout: 300
+                runas: root
+            ValidateService:
+              - location: scripts/validate_service.sh
+                timeout: 300
+                runas: root
+          APPSPEC
+
+      - name: Create deployment scripts
+        run: |
+          mkdir -p deploy/scripts
+
+          # application_stop.sh
+          cat > deploy/scripts/application_stop.sh << 'STOP'
+          #!/bin/bash
+          set -e
+          echo "Stopping services..."
+          systemctl stop php8.3-fpm || true
+          systemctl stop nginx || true
+          STOP
+
+          # before_install.sh
+          cat > deploy/scripts/before_install.sh << 'BEFORE'
+          #!/bin/bash
+          set -e
+          echo "Preparing for installation..."
+
+          # Backup current .env if exists
+          if [ -f /var/www/app/.env ]; then
+            cp /var/www/app/.env /tmp/.env.backup
+          fi
+
+          # Clean old deployment
+          rm -rf /var/www/app/*
+          BEFORE
+
+          # after_install.sh
+          cat > deploy/scripts/after_install.sh << 'AFTER'
+          #!/bin/bash
+          set -e
+          echo "Configuring application..."
+
+          cd /var/www/app
+
+          # Restore .env from SSM (already done by user_data, but ensure it exists)
+          if [ ! -f .env ] && [ -f /tmp/.env.backup ]; then
+            cp /tmp/.env.backup .env
+          fi
+
+          # Set permissions
+          chown -R www-data:www-data /var/www/app
+          chmod -R 755 /var/www/app/storage
+          chmod -R 755 /var/www/app/bootstrap/cache
+
+          # Laravel optimizations
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+
+          # Run migrations (opcional - comentar si no quieres auto-migrate)
+          # php artisan migrate --force
+          AFTER
+
+          # application_start.sh
+          cat > deploy/scripts/application_start.sh << 'START'
+          #!/bin/bash
+          set -e
+          echo "Starting services..."
+
+          systemctl start php8.3-fpm
+          systemctl start nginx
+
+          # Verificar que los servicios estén corriendo
+          sleep 2
+          systemctl is-active --quiet php8.3-fpm || exit 1
+          systemctl is-active --quiet nginx || exit 1
+          START
+
+          # validate_service.sh
+          cat > deploy/scripts/validate_service.sh << 'VALIDATE'
+          #!/bin/bash
+          set -e
+          echo "Validating deployment..."
+
+          # Health check
+          for i in {1..30}; do
+            if curl -f http://localhost/ > /dev/null 2>&1; then
+              echo "Application is healthy!"
+              exit 0
+            fi
+            echo "Waiting for application... ($i/30)"
+            sleep 2
+          done
+
+          echo "Application failed to start!"
+          exit 1
+          VALIDATE
+
+          # Hacer scripts ejecutables
+          chmod +x deploy/scripts/*.sh
+
+      - name: Create deployment archive
+        run: |
+          cd deploy
+          zip -r ../deployment.zip . -x "*.git*"
+          cd ..
+          echo "Archive size: $(du -h deployment.zip | cut -f1)"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::838108223027:role/massnexus-prd-gh-backend-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          S3_KEY="deployments/${GITHUB_REF_NAME}/${TIMESTAMP}-${GITHUB_SHA:0:7}.zip"
+
+          aws s3 cp deployment.zip s3://${{ env.S3_BUCKET }}/${S3_KEY}
+          aws s3 cp deployment.zip s3://${{ env.S3_BUCKET }}/latest.zip
+
+          echo "S3_KEY=${S3_KEY}" >> $GITHUB_ENV
+
+      - name: Deploy with CodeDeploy
+        id: codedeploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name ${{ env.CODEDEPLOY_APP }} \
+            --deployment-group-name ${{ env.CODEDEPLOY_GROUP }} \
+            --s3-location bucket=${{ env.S3_BUCKET }},key=latest.zip,bundleType=zip \
+            --description "Deploy from GitHub Actions - Branch: ${{ github.ref_name }} - Commit: ${{ github.sha }}" \
+            --query 'deploymentId' \
+            --output text)
+
+          echo "deployment_id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> $GITHUB_ENV
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for deployment: ${{ env.DEPLOYMENT_ID }}"
+
+          aws deploy wait deployment-successful \
+            --deployment-id ${{ env.DEPLOYMENT_ID }} \
+            --cli-read-timeout 600
+
+      - name: Get deployment status
+        if: always()
+        run: |
+          STATUS=$(aws deploy get-deployment \
+            --deployment-id ${{ env.DEPLOYMENT_ID }} \
+            --query 'deploymentInfo.status' \
+            --output text)
+
+          echo "Deployment Status: ${STATUS}"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment ID**: ${{ env.DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Artifact**: s3://${{ env.S3_BUCKET }}/${{ env.S3_KEY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Backend URL**: https://dev.yieldpro.io" >> $GITHUB_STEP_SUMMARY
