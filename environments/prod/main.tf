@@ -31,9 +31,9 @@ module "vpc" {
     cidrsubnet(var.vpc_cidr, 5, 21)
   ]
 
-  enable_nat_gateway     = false
+  enable_nat_gateway     = var.enable_nat_gateway
   single_nat_gateway     = false
-  one_nat_gateway_per_az = false
+  one_nat_gateway_per_az = var.enable_nat_gateway # Solo si está habilitado
 
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -246,6 +246,10 @@ data "aws_cloudfront_cache_policy" "managed_optimized" {
   name = "Managed-CachingOptimized"
 }
 
+data "aws_cloudfront_response_headers_policy" "managed_security" {
+  name = "Managed-SecurityHeadersPolicy"
+}
+
 
 ########################
 # CloudFront (prod) con OAC
@@ -282,13 +286,14 @@ module "cloudfront" {
   }
 
   default_cache_behavior = {
-    target_origin_id       = "s3-origin"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
-    cache_policy_id        = data.aws_cloudfront_cache_policy.managed_optimized.id
-    use_forwarded_values   = false
+    target_origin_id           = "s3-origin"
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = true
+    cache_policy_id            = data.aws_cloudfront_cache_policy.managed_optimized.id
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.managed_security.id
+    use_forwarded_values       = false
   }
 
   # WAF asociado (desde security-waf.tf)
@@ -355,25 +360,19 @@ resource "aws_security_group" "alb" {
   vpc_id      = module.vpc.vpc_id
 
 ingress {
-  description = "HTTPS from allowed IP only"
+  description = "HTTPS from allowed IPs"
   from_port   = 443
   to_port     = 443
   protocol    = "tcp"
-  cidr_blocks = [
-    "200.123.128.225/32",
-    "190.19.143.121/32", # si querés mantener la vieja por ahora
-  ]
+  cidr_blocks = var.allowed_ips_alb
 }
 
 ingress {
-  description = "HTTP from allowed IP only"
+  description = "HTTP from allowed IPs (redirects to HTTPS)"
   from_port   = 80
   to_port     = 80
   protocol    = "tcp"
-  cidr_blocks = [
-    "200.123.128.225/32",
-    "190.19.143.121/32",
-  ]
+  cidr_blocks = var.allowed_ips_alb
 }
 
   egress {
@@ -472,7 +471,7 @@ resource "aws_lb_listener" "https" {
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = "arn:aws:acm:us-east-1:838108223027:certificate/76a7501d-f39c-4b68-8a66-f4db5fde1925"
+  certificate_arn   = aws_acm_certificate.backend.arn
 
   default_action {
     type             = "forward"
@@ -529,45 +528,9 @@ output "backend_cert_validation_records" {
 }
 
 ########################
-# ACM (opcional) para el ALB
+# Certificado ACM ya está definido arriba como aws_acm_certificate.backend
+# No necesitamos duplicados
 ########################
-
-# 1) Solicitud del certificado (si hay dominio)
-resource "aws_acm_certificate" "alb" {
-  count                     = var.backend_domain_name != "" ? 1 : 0
-  domain_name               = var.backend_domain_name
-  validation_method         = "DNS"
-  subject_alternative_names = []
-
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  tags = { env = "prod", role = "alb-cert" }
-}
-
-# 2) (Opcional) Validación automática si usás Route53
-resource "aws_route53_record" "alb_cert_validation" {
-  count   = var.backend_domain_name != "" && var.backend_domain_zone_id != "" ? 1 : 0
-  zone_id = var.backend_domain_zone_id
-
-  name    = one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_name
-  type    = one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_type
-  records = [one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_value]
-  ttl     = 60
-}
-
-resource "aws_acm_certificate_validation" "alb" {
-  count           = 0
-  certificate_arn = aws_acm_certificate.alb[0].arn
-  # validation_record_fqdns = var.backend_domain_zone_id != "" ? [aws_route53_record.alb_cert_validation[0].fqdn] : []
-}
-
-# Output útil (queda vacío si no seteaste dominio)
-output "alb_certificate_arn" {
-  value       = try(aws_acm_certificate_validation.alb[0].certificate_arn, "")
-  description = "ARN del cert ACM validado para el ALB (si se configuró dominio)."
-}
 
 
 ########################
@@ -623,7 +586,7 @@ resource "aws_launch_template" "app" {
 
   network_interfaces {
     security_groups             = [aws_security_group.app.id]
-    associate_public_ip_address = true # TEMPORAL hasta tener NAT
+    associate_public_ip_address = !var.use_private_subnets_for_ec2 # Solo si está en subnets públicas
   }
 
   user_data = base64encode(<<-EOF
@@ -631,15 +594,95 @@ resource "aws_launch_template" "app" {
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
 
+    # Log de inicio
+    echo "[$(date)] Starting EC2 bootstrap for Laravel 12 / PHP 8.3" | tee -a /var/log/user-data.log
+
+    # Paquetes base
     apt-get update -y
-    apt-get install -y nginx software-properties-common unzip jq awscli
+    apt-get install -y nginx software-properties-common unzip jq curl wget git ca-certificates
+
+    # AWS CLI v2 (más reciente y mejor performance)
+    if ! command -v aws &>/dev/null; then
+      cd /tmp
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+      unzip -q awscliv2.zip
+      ./aws/install
+      rm -rf aws awscliv2.zip
+    fi
+
+    # PHP 8.3 + extensiones para Laravel 12
     add-apt-repository ppa:ondrej/php -y
     apt-get update -y
-    apt-get install -y php8.2 php8.2-fpm php8.2-cli php8.2-mysql php8.2-xml php8.2-curl php8.2-mbstring php8.2-redis
+    apt-get install -y \
+      php8.3 \
+      php8.3-fpm \
+      php8.3-cli \
+      php8.3-mysql \
+      php8.3-pgsql \
+      php8.3-xml \
+      php8.3-curl \
+      php8.3-mbstring \
+      php8.3-zip \
+      php8.3-bcmath \
+      php8.3-gd \
+      php8.3-intl \
+      php8.3-redis \
+      php8.3-opcache
 
+    # Composer 2.x
+    if ! command -v composer &>/dev/null; then
+      curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer --2
+      chmod +x /usr/local/bin/composer
+    fi
+
+    # Node.js 20 LTS (para compilar assets si es necesario)
+    if ! command -v node &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+    fi
+
+    # Directorios de la aplicación
     mkdir -p /var/www/app /var/log/app
 
-    # Nginx vhost
+    # Configuración PHP-FPM optimizada para producción
+    cat > /etc/php/8.3/fpm/pool.d/www.conf <<'PHPFPM'
+    [www]
+    user = www-data
+    group = www-data
+    listen = /run/php/php8.3-fpm.sock
+    listen.owner = www-data
+    listen.group = www-data
+    listen.mode = 0660
+
+    pm = dynamic
+    pm.max_children = 50
+    pm.start_servers = 5
+    pm.min_spare_servers = 5
+    pm.max_spare_servers = 35
+    pm.max_requests = 500
+
+    php_admin_value[error_log] = /var/log/php8.3-fpm.log
+    php_admin_flag[log_errors] = on
+    php_value[session.save_handler] = files
+    php_value[session.save_path] = /var/lib/php/sessions
+    PHPFPM
+
+    # Optimizaciones PHP para Laravel (php.ini)
+    cat > /etc/php/8.3/fpm/conf.d/99-laravel.ini <<'PHPINI'
+    memory_limit = 256M
+    upload_max_filesize = 64M
+    post_max_size = 64M
+    max_execution_time = 300
+    max_input_time = 300
+    opcache.enable=1
+    opcache.memory_consumption=128
+    opcache.interned_strings_buffer=8
+    opcache.max_accelerated_files=10000
+    opcache.revalidate_freq=2
+    opcache.fast_shutdown=1
+    PHPINI
+
+    # Nginx vhost para Laravel
     cat >/etc/nginx/sites-available/app <<'NGINX'
     server {
       listen 80 default_server;
@@ -647,71 +690,97 @@ resource "aws_launch_template" "app" {
       root /var/www/app/public;
       index index.php index.html;
 
-      location /health { return 200 'ok'; add_header Content-Type text/plain; }
+      client_max_body_size 64M;
 
+      # Health check endpoint (no pasa por Laravel)
+      location /health {
+        access_log off;
+        return 200 'ok';
+        add_header Content-Type text/plain;
+      }
+
+      # Laravel routes
       location / {
         try_files $uri $uri/ /index.php?$query_string;
       }
 
+      # PHP-FPM
       location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+      }
+
+      # Deny access to hidden files
+      location ~ /\. {
+        deny all;
       }
     }
     NGINX
 
     ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
     rm -f /etc/nginx/sites-enabled/default
-    systemctl enable --now nginx php8.2-fpm
 
+    # Habilitar servicios
+    systemctl enable nginx php8.3-fpm
+    systemctl restart php8.3-fpm nginx
+
+    # Obtener configuración desde SSM y Secrets Manager
     REGION="${var.region}"
     PREFIX="/${var.name}/laravel/"
 
     get_ssm () {
-      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" | jq -r .Parameter.Value
+      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" 2>/dev/null | jq -r .Parameter.Value || echo ""
     }
 
-    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY" || echo "")
+    echo "[$(date)] Fetching configuration from SSM/Secrets Manager..." | tee -a /var/log/user-data.log
+
+    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY")
     DB_HOST=$(get_ssm "$${PREFIX}DB_HOST")
     DB_NAME=$(get_ssm "$${PREFIX}DB_NAME")
     DB_USER=$(get_ssm "$${PREFIX}DB_USER")
     DB_SECRET_ARN=$(get_ssm "$${PREFIX}DB_SECRET_ARN")
     REDIS_HOST=$(get_ssm "$${PREFIX}REDIS_HOST")
+    REDIS_PASSWORD=$(get_ssm "$${PREFIX}REDIS_PASSWORD")
+
+    if [ -z "$DB_SECRET_ARN" ]; then
+      echo "[ERROR] DB_SECRET_ARN not found in SSM" | tee -a /var/log/user-data.log
+      exit 1
+    fi
 
     DB_PASS=$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ARN" --region "$REGION" \
       | jq -r '.SecretString | fromjson | .password')
 
-
-    ##############################
     # CodeDeploy Agent (Ubuntu 22.04)
-    ##############################
     if ! systemctl is-active --quiet codedeploy-agent; then
-      echo "[codedeploy] installing agent..."
-      apt-get update -y
-      # ruby es requerido por el agente clásico
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ruby wget
+      echo "[$(date)] Installing CodeDeploy agent..." | tee -a /var/log/user-data.log
+      apt-get install -y ruby-full wget
       cd /tmp
-      # instalador oficial para us-east-1
-      wget -q https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install -O install_codedeploy
+      wget -q https://aws-codedeploy-${var.region}.s3.${var.region}.amazonaws.com/latest/install -O install_codedeploy
       chmod +x install_codedeploy
-      ./install_codedeploy auto || ./install_codedeploy auto
+      ./install_codedeploy auto
       systemctl enable codedeploy-agent
-      systemctl restart codedeploy-agent
-      echo "[codedeploy] agent installed"
-    else
-      echo "[codedeploy] agent already running"
-    fi 
+      systemctl start codedeploy-agent
+      echo "[$(date)] CodeDeploy agent installed" | tee -a /var/log/user-data.log
+    fi
 
-    # .env mínimo
+    # Generar .env de Laravel
     cat > /var/www/app/.env <<ENV
     APP_NAME=Laravel
     APP_ENV=production
     APP_KEY=$${APP_KEY}
     APP_DEBUG=false
-    APP_URL=http://localhost
+    APP_URL=https://${var.backend_domain_name}
 
-    LOG_CHANNEL=single
-    LOG_LEVEL=info
+    LOG_CHANNEL=stack
+    LOG_LEVEL=error
 
     DB_CONNECTION=mysql
     DB_HOST=$${DB_HOST}
@@ -720,20 +789,36 @@ resource "aws_launch_template" "app" {
     DB_USERNAME=$${DB_USER}
     DB_PASSWORD=$${DB_PASS}
 
+    BROADCAST_DRIVER=log
     CACHE_DRIVER=redis
+    FILESYSTEM_DISK=local
     QUEUE_CONNECTION=redis
+    SESSION_DRIVER=redis
+
     REDIS_HOST=$${REDIS_HOST}
+    REDIS_PASSWORD=$${REDIS_PASSWORD}
     REDIS_PORT=6379
+
+    AWS_DEFAULT_REGION=${var.region}
+    AWS_BUCKET=${var.name}-storage
     ENV
 
+    # Placeholder inicial (será reemplazado por CodeDeploy)
     mkdir -p /var/www/app/public
     cat >/var/www/app/public/index.php <<'PHP'
     <?php
-    echo "Laravel placeholder running (prod)";
+    phpinfo();
+    echo "\n\n<!-- Laravel 12 / PHP 8.3 Ready (prod) -->";
     PHP
 
+    # Permisos
     chown -R www-data:www-data /var/www/app
+    chmod -R 755 /var/www/app
+    chmod -R 775 /var/www/app/storage 2>/dev/null || true
+    chmod -R 775 /var/www/app/bootstrap/cache 2>/dev/null || true
+
     systemctl reload nginx
+    echo "[$(date)] Bootstrap completed successfully" | tee -a /var/log/user-data.log
   EOF
   )
 
@@ -753,7 +838,7 @@ resource "aws_autoscaling_group" "app" {
   max_size                  = 2
   min_size                  = 1
   desired_capacity          = 1
-  vpc_zone_identifier       = module.vpc.public_subnets
+  vpc_zone_identifier       = var.use_private_subnets_for_ec2 ? module.vpc.private_subnets : module.vpc.public_subnets
   health_check_type         = "ELB"
   health_check_grace_period = 300
 
@@ -1015,8 +1100,13 @@ resource "aws_elasticache_subnet_group" "redis" {
 }
 
 ########################
-# Redis 7 - 1 nodo, cifrado
+# Redis 7 - 1 nodo, cifrado + AUTH
 ########################
+resource "random_password" "redis_auth" {
+  length  = 32
+  special = false # Redis AUTH no soporta caracteres especiales
+}
+
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id = "${var.name}-redis"
   description          = "Redis for ${var.name} (prod)"
@@ -1024,11 +1114,13 @@ resource "aws_elasticache_replication_group" "redis" {
   engine               = "redis"
   engine_version       = "7.0"
   parameter_group_name = "default.redis7"
-  node_type            = "cache.t4g.micro" # ajustá cuando crezca
-  num_cache_clusters   = 1                 # single node en prod inicial
+  node_type            = "cache.t4g.micro" # Ajustar cuando crezca
+  num_cache_clusters   = 1                 # Single node (considerar Multi-AZ para prod real)
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
+  auth_token_enabled         = true
+  auth_token                 = random_password.redis_auth.result
 
   security_group_ids = [aws_security_group.redis.id]
   subnet_group_name  = aws_elasticache_subnet_group.redis.name
@@ -1042,12 +1134,18 @@ output "redis_primary_endpoint" {
 }
 
 ########################
-# SSM: REDIS_HOST
+# SSM: REDIS_HOST y REDIS_PASSWORD
 ########################
 resource "aws_ssm_parameter" "redis_host" {
   name  = "/${var.name}/laravel/REDIS_HOST"
   type  = "SecureString"
   value = aws_elasticache_replication_group.redis.primary_endpoint_address
+}
+
+resource "aws_ssm_parameter" "redis_password" {
+  name  = "/${var.name}/laravel/REDIS_PASSWORD"
+  type  = "SecureString"
+  value = random_password.redis_auth.result
 }
 
 ########################
@@ -1291,8 +1389,8 @@ data "aws_iam_policy_document" "gh_backend_policy" {
       "s3:HeadObject"
     ]
     resources = [
-      "arn:aws:s3:::massnexus-prd-backend-artifacts",
-      "arn:aws:s3:::massnexus-prd-backend-artifacts/*"
+      aws_s3_bucket.backend_artifacts.arn,
+      "${aws_s3_bucket.backend_artifacts.arn}/*"
     ]
   }
 

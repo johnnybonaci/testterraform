@@ -80,3 +80,24 @@ variable "security_alert_email" {
   description = "Email para recibir alertas de seguridad (GuardDuty, CloudTrail)"
   default     = "security@massnexus.com" # CAMBIAR POR TU EMAIL REAL
 }
+
+variable "enable_nat_gateway" {
+  type        = bool
+  description = "Habilitar NAT Gateway (recomendado para prod real, pero cuesta ~$32/mes por NAT)"
+  default     = false # Deshabilitado por defecto, usa VPC Endpoints
+}
+
+variable "allowed_ips_alb" {
+  type        = list(string)
+  description = "IPs permitidas para acceder al ALB (prod). Usar 0.0.0.0/0 si es público o lista de IPs específicas"
+  default = [
+    "200.123.128.225/32",
+    "190.19.143.121/32",
+  ]
+}
+
+variable "use_private_subnets_for_ec2" {
+  type        = bool
+  description = "Usar subnets privadas para EC2 (requiere NAT Gateway o VPC Endpoints). False = subnets públicas"
+  default     = false # False por defecto para testing sin NAT
+}
