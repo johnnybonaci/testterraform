@@ -1,0 +1,356 @@
+# Deploy Backend a Producción via CodeDeploy
+name: Deploy Backend to Production
+
+on:
+  push:
+    branches:
+      - main  # Cambiar según tu flujo de trabajo
+
+  workflow_dispatch:  # Permite deploy manual
+
+env:
+  AWS_REGION: us-east-1
+  PHP_VERSION: '8.3'
+
+permissions:
+  id-token: write  # Requerido para OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and Deploy via CodeDeploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, curl, zip, bcmath, pdo, mysql, redis
+          tools: composer:v2
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+      - name: Crear archivo .env.example si no existe
+        run: |
+          if [ ! -f .env.example ]; then
+            echo "APP_ENV=production" > .env.example
+            echo "APP_DEBUG=false" >> .env.example
+          fi
+
+      - name: Setup Node.js (para compilar assets)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias NPM y compilar assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Crear artefacto de deployment
+        run: |
+          # Crear directorio temporal
+          mkdir -p deploy-artifact
+
+          # Copiar archivos necesarios (excluir node_modules, .git, tests, etc.)
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='storage/logs/*' \
+            --exclude='storage/framework/cache/*' \
+            --exclude='storage/framework/sessions/*' \
+            --exclude='storage/framework/views/*' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            ./ deploy-artifact/
+
+          # Asegurar permisos correctos
+          chmod -R 755 deploy-artifact/storage deploy-artifact/bootstrap/cache
+
+      - name: Crear appspec.yml para CodeDeploy
+        run: |
+          cat > deploy-artifact/appspec.yml <<'EOF'
+          version: 0.0
+          os: linux
+          files:
+            - source: /
+              destination: /var/www/app
+          permissions:
+            - object: /var/www/app
+              owner: www-data
+              group: www-data
+              type:
+                - directory
+                - file
+            - object: /var/www/app/storage
+              owner: www-data
+              group: www-data
+              mode: 775
+              type:
+                - directory
+            - object: /var/www/app/bootstrap/cache
+              owner: www-data
+              group: www-data
+              mode: 775
+              type:
+                - directory
+          hooks:
+            BeforeInstall:
+              - location: scripts/before_install.sh
+                timeout: 300
+                runas: root
+            AfterInstall:
+              - location: scripts/after_install.sh
+                timeout: 600
+                runas: root
+            ApplicationStart:
+              - location: scripts/application_start.sh
+                timeout: 300
+                runas: root
+            ApplicationStop:
+              - location: scripts/application_stop.sh
+                timeout: 60
+                runas: root
+            ValidateService:
+              - location: scripts/validate_service.sh
+                timeout: 120
+                runas: root
+          EOF
+
+      - name: Crear scripts de CodeDeploy
+        run: |
+          mkdir -p deploy-artifact/scripts
+
+          # before_install.sh
+          cat > deploy-artifact/scripts/before_install.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "=== BeforeInstall: Preparando deployment ==="
+
+          # Backup de .env actual si existe
+          if [ -f /var/www/app/.env ]; then
+            cp /var/www/app/.env /tmp/.env.backup
+            echo "✓ Backup de .env creado"
+          fi
+
+          # Limpiar releases viejos (mantener últimos 3)
+          if [ -d /var/www/app ]; then
+            echo "✓ Directorio existente encontrado"
+          fi
+          SCRIPT
+
+          # after_install.sh
+          cat > deploy-artifact/scripts/after_install.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "=== AfterInstall: Configurando aplicación ==="
+
+          cd /var/www/app
+
+          # Restaurar .env desde backup
+          if [ -f /tmp/.env.backup ]; then
+            cp /tmp/.env.backup .env
+            echo "✓ .env restaurado desde backup"
+          fi
+
+          # Crear directorios de storage si no existen
+          mkdir -p storage/framework/{sessions,views,cache}
+          mkdir -p storage/logs
+          mkdir -p bootstrap/cache
+
+          # Permisos correctos
+          chown -R www-data:www-data storage bootstrap/cache
+          chmod -R 775 storage bootstrap/cache
+
+          # Optimizaciones de Laravel
+          sudo -u www-data php artisan config:cache
+          sudo -u www-data php artisan route:cache
+          sudo -u www-data php artisan view:cache
+
+          # Ejecutar migraciones (cuidado en prod, mejor manual)
+          # sudo -u www-data php artisan migrate --force
+
+          echo "✓ Configuración completada"
+          SCRIPT
+
+          # application_start.sh
+          cat > deploy-artifact/scripts/application_start.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "=== ApplicationStart: Iniciando servicios ==="
+
+          # Reiniciar PHP-FPM
+          systemctl restart php8.3-fpm
+          echo "✓ PHP-FPM reiniciado"
+
+          # Reiniciar Nginx
+          systemctl restart nginx
+          echo "✓ Nginx reiniciado"
+
+          # Reiniciar workers de Supervisor
+          supervisorctl restart all
+          echo "✓ Workers reiniciados"
+
+          # Limpiar caches adicionales
+          cd /var/www/app
+          sudo -u www-data php artisan cache:clear
+          sudo -u www-data php artisan view:clear
+
+          echo "✓ Servicios iniciados correctamente"
+          SCRIPT
+
+          # application_stop.sh
+          cat > deploy-artifact/scripts/application_stop.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "=== ApplicationStop: Deteniendo gracefully ==="
+
+          # Detener workers para evitar jobs a medias
+          supervisorctl stop all || true
+          echo "✓ Workers detenidos"
+
+          # Dar tiempo para que terminen requests activos
+          sleep 5
+          SCRIPT
+
+          # validate_service.sh
+          cat > deploy-artifact/scripts/validate_service.sh <<'SCRIPT'
+          #!/bin/bash
+          set -e
+
+          echo "=== ValidateService: Verificando deployment ==="
+
+          # Verificar que PHP-FPM está corriendo
+          systemctl is-active --quiet php8.3-fpm
+          echo "✓ PHP-FPM running"
+
+          # Verificar que Nginx está corriendo
+          systemctl is-active --quiet nginx
+          echo "✓ Nginx running"
+
+          # Verificar que workers están corriendo
+          supervisorctl status | grep -q "RUNNING"
+          echo "✓ Workers running"
+
+          # Health check HTTP
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health || echo "000")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✓ Health check passed (HTTP $HTTP_CODE)"
+          else
+            echo "✗ Health check failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "✓ Deployment validado correctamente"
+          SCRIPT
+
+          # Dar permisos de ejecución
+          chmod +x deploy-artifact/scripts/*.sh
+
+      - name: Empaquetar artefacto
+        run: |
+          cd deploy-artifact
+          zip -r ../deploy-bundle.zip . -x "*.git*"
+          cd ..
+
+          echo "📦 Bundle size:"
+          ls -lh deploy-bundle.zip
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_BACKEND }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Backend-Deploy
+
+      - name: Upload bundle to S3
+        id: upload
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          S3_KEY="deployments/backend-${TIMESTAMP}-${GITHUB_SHA:0:7}.zip"
+
+          aws s3 cp deploy-bundle.zip \
+            s3://${{ secrets.S3_BUCKET_ARTIFACTS }}/${S3_KEY}
+
+          echo "s3-key=${S3_KEY}" >> $GITHUB_OUTPUT
+          echo "✅ Bundle uploaded to S3"
+
+      - name: Crear deployment en CodeDeploy
+        id: deploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name ${{ secrets.CODEDEPLOY_APPLICATION }} \
+            --deployment-group-name ${{ secrets.CODEDEPLOY_DEPLOYMENT_GROUP }} \
+            --s3-location bucket=${{ secrets.S3_BUCKET_ARTIFACTS }},key=${{ steps.upload.outputs.s3-key }},bundleType=zip \
+            --description "Deploy from GitHub Actions - Commit ${GITHUB_SHA:0:7}" \
+            --query 'deploymentId' \
+            --output text)
+
+          echo "deployment-id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+          echo "🚀 CodeDeploy deployment created: ${DEPLOYMENT_ID}"
+
+      - name: Monitorear deployment
+        run: |
+          DEPLOYMENT_ID="${{ steps.deploy.outputs.deployment-id }}"
+
+          echo "Monitoring deployment ${DEPLOYMENT_ID}..."
+
+          while true; do
+            STATUS=$(aws deploy get-deployment \
+              --deployment-id ${DEPLOYMENT_ID} \
+              --query 'deploymentInfo.status' \
+              --output text)
+
+            echo "Status: ${STATUS}"
+
+            if [ "${STATUS}" = "Succeeded" ]; then
+              echo "✅ Deployment completado exitosamente"
+              break
+            elif [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "Stopped" ]; then
+              echo "❌ Deployment falló: ${STATUS}"
+
+              # Obtener detalles del error
+              aws deploy get-deployment \
+                --deployment-id ${DEPLOYMENT_ID} \
+                --query 'deploymentInfo.errorInformation'
+
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "=== Deployment Summary ==="
+          echo "📝 Commit: ${GITHUB_SHA:0:7}"
+          echo "📦 S3 Bundle: ${{ steps.upload.outputs.s3-key }}"
+          echo "🚀 Deployment ID: ${{ steps.deploy.outputs.deployment-id }}"
+          echo "🔗 CodeDeploy Console: https://console.aws.amazon.com/codesuite/codedeploy/deployments/${{ steps.deploy.outputs.deployment-id }}?region=${{ env.AWS_REGION }}"
