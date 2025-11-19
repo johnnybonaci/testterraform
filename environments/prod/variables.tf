@@ -75,6 +75,12 @@ variable "github_repo_back" {
   default = "beatsmedia/yieldpro_back_tmp"
 }
 
+variable "alert_email" {
+  type        = string
+  description = "Email para recibir alertas de CloudWatch (RDS, Redis, EC2, ALB)"
+  default     = "ops@massnexus.com" # CAMBIAR POR TU EMAIL REAL
+}
+
 variable "security_alert_email" {
   type        = string
   description = "Email para recibir alertas de seguridad (GuardDuty, CloudTrail)"
