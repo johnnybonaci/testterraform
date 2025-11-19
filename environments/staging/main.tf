@@ -909,8 +909,8 @@ resource "aws_db_instance" "mysql" {
 
   backup_retention_period  = var.db_backup_days
   delete_automated_backups = true
-  skip_final_snapshot      = false
-  final_snapshot_identifier = "${var.name}-mysql-final-snapshot"
+  skip_final_snapshot      = true  # Temporal para destroy
+  # final_snapshot_identifier = "${var.name}-mysql-final-snapshot"
   deletion_protection      = false
 
   maintenance_window = "Sun:01:00-Sun:03:00"
