@@ -89,10 +89,9 @@ variable "enable_nat_gateway" {
 
 variable "allowed_ips_alb" {
   type        = list(string)
-  description = "IPs permitidas para acceder al ALB (prod). Usar 0.0.0.0/0 si es público o lista de IPs específicas"
+  description = "IPs permitidas para acceder al ALB. Público con Cloudflare Zero Trust controlando acceso"
   default = [
-    "200.123.128.225/32",
-    "190.19.143.121/32",
+    "0.0.0.0/0", # Acceso público - Cloudflare Zero Trust maneja autenticación
   ]
 }
 

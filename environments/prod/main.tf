@@ -580,7 +580,7 @@ data "aws_ami" "ubuntu" {
 resource "aws_launch_template" "app" {
   name_prefix   = "${var.name}-lt-"
   image_id      = data.aws_ami.ubuntu.id
-  instance_type = "t3.medium"
+  instance_type = "c6i.large" # 2 vCPU dedicados, 4GB RAM - mejor performance que t3
 
   iam_instance_profile { name = aws_iam_instance_profile.ec2_profile.name }
 
@@ -850,13 +850,13 @@ resource "aws_launch_template" "app" {
 }
 
 ########################
-# Auto Scaling Group
+# Auto Scaling Group - Alta disponibilidad con mínimo 2 instancias
 ########################
 resource "aws_autoscaling_group" "app" {
   name                      = "${var.name}-asg"
-  max_size                  = 2
-  min_size                  = 1
-  desired_capacity          = 1
+  max_size                  = 4 # Escala hasta 4 instancias bajo carga
+  min_size                  = 2 # Siempre 2 instancias corriendo (HA)
+  desired_capacity          = 2 # Iniciar con 2 instancias en diferentes AZs
   vpc_zone_identifier       = var.use_private_subnets_for_ec2 ? module.vpc.private_subnets : module.vpc.public_subnets
   health_check_type         = "ELB"
   health_check_grace_period = 300
@@ -872,10 +872,21 @@ resource "aws_autoscaling_group" "app" {
     value               = "${var.name}-app"
     propagate_at_launch = true
   }
+  tag {
+    key                 = "env"
+    value               = "prod"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "stack"
+    value               = "massnexus"
+    propagate_at_launch = true
+  }
+
   instance_refresh {
     strategy = "Rolling"
     preferences {
-      min_healthy_percentage = 50
+      min_healthy_percentage = 50 # Siempre mantiene al menos 1 instancia healthy durante updates
       instance_warmup        = 60
     }
   }
@@ -1119,7 +1130,7 @@ resource "aws_elasticache_subnet_group" "redis" {
 }
 
 ########################
-# Redis 7 - 1 nodo, cifrado + AUTH
+# Redis 7 - Multi-AZ con failover automático, cifrado + AUTH
 ########################
 resource "random_password" "redis_auth" {
   length  = 32
@@ -1128,13 +1139,17 @@ resource "random_password" "redis_auth" {
 
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id = "${var.name}-redis"
-  description          = "Redis for ${var.name} (prod)"
+  description          = "Redis for ${var.name} (prod) - Multi-AZ HA"
 
   engine               = "redis"
   engine_version       = "7.0"
   parameter_group_name = "default.redis7"
-  node_type            = "cache.t4g.micro" # Ajustar cuando crezca
-  num_cache_clusters   = 1                 # Single node (considerar Multi-AZ para prod real)
+  node_type            = "cache.t4g.small" # 1.37GB - capacidad adecuada para sessions + cache + queues
+  num_cache_clusters   = 3                 # 1 primary + 2 replicas en diferentes AZs
+
+  # Alta disponibilidad
+  automatic_failover_enabled = true # Failover automático si primary falla
+  multi_az_enabled          = true  # Distribuir replicas en diferentes AZs
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
@@ -1145,7 +1160,12 @@ resource "aws_elasticache_replication_group" "redis" {
   subnet_group_name  = aws_elasticache_subnet_group.redis.name
   port               = 6379
 
-  tags = { env = "prod", stack = "massnexus", role = "redis" }
+  # Mantenimiento y snapshots
+  snapshot_retention_limit = 5        # Retener 5 snapshots diarios
+  snapshot_window          = "03:00-05:00" # Ventana de backup
+  maintenance_window       = "sun:05:00-sun:07:00"
+
+  tags = { env = "prod", stack = "massnexus", role = "redis-ha" }
 }
 
 output "redis_primary_endpoint" {
