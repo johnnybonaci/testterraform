@@ -147,7 +147,7 @@ resource "aws_wafv2_web_acl" "cloudfront" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "waf-cloudfront"
   }
 }
@@ -333,7 +333,7 @@ resource "aws_wafv2_web_acl" "alb" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "waf-alb"
   }
 }

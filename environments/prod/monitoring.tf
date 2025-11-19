@@ -11,7 +11,7 @@ resource "aws_sns_topic" "alerts" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -32,7 +32,7 @@ resource "aws_cloudwatch_log_group" "app" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -43,7 +43,7 @@ resource "aws_cloudwatch_log_group" "nginx" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -54,7 +54,7 @@ resource "aws_cloudwatch_log_group" "workers" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 

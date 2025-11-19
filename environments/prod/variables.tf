@@ -5,7 +5,7 @@ variable "region" {
 
 variable "name" {
   type    = string
-  default = "massnexus-prd"
+  default = "yp-test"
 }
 
 variable "vpc_cidr" {

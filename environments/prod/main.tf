@@ -43,7 +43,7 @@ module "vpc" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -142,7 +142,7 @@ module "logs_bucket" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "logs"
   }
 }
@@ -231,7 +231,7 @@ module "s3_frontend" {
     target_prefix = "s3-frontend/"
   }
 
-  tags = { env = "prod", stack = "massnexus", role = "frontend" }
+  tags = { env = "prod", stack = "yieldpro", role = "frontend" }
 }
 
 resource "aws_cloudfront_origin_access_control" "frontend" {
@@ -329,7 +329,7 @@ module "cloudfront" {
     include_cookies = false
   }
 
-  tags = { env = "prod", stack = "massnexus", role = "cdn" }
+  tags = { env = "prod", stack = "yieldpro", role = "cdn" }
 }
 
 ########################
@@ -425,7 +425,7 @@ resource "aws_lb" "app" {
 
   enable_deletion_protection = false
 
-  tags = { env = "prod", stack = "massnexus", role = "alb" }
+  tags = { env = "prod", stack = "yieldpro", role = "alb" }
 }
 
 resource "aws_lb_target_group" "app" {
@@ -449,7 +449,7 @@ resource "aws_lb_target_group" "app" {
 
   deregistration_delay = 15
 
-  tags = { env = "prod", stack = "massnexus", role = "alb-tg" }
+  tags = { env = "prod", stack = "yieldpro", role = "alb-tg" }
 }
 
 resource "aws_lb_listener" "http" {
@@ -1002,7 +1002,7 @@ resource "aws_db_instance" "mysql" {
 
   performance_insights_enabled = true
 
-  tags = { env = "prod", stack = "massnexus", role = "rds" }
+  tags = { env = "prod", stack = "yieldpro", role = "rds" }
 }
 
 output "rds_endpoint" {
@@ -1165,7 +1165,7 @@ resource "aws_elasticache_replication_group" "redis" {
   snapshot_window          = "03:00-05:00" # Ventana de backup
   maintenance_window       = "sun:05:00-sun:07:00"
 
-  tags = { env = "prod", stack = "massnexus", role = "redis-ha" }
+  tags = { env = "prod", stack = "yieldpro", role = "redis-ha" }
 }
 
 output "redis_primary_endpoint" {

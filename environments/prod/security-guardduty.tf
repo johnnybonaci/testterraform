@@ -31,7 +31,7 @@ resource "aws_guardduty_detector" "main" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "threat-detection"
   }
 }
@@ -47,7 +47,7 @@ resource "aws_sns_topic" "guardduty_alerts" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
