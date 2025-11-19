@@ -489,6 +489,11 @@ php artisan view:cache
 
 echo "Optimizing..."
 php artisan optimize
+
+echo "Restarting queue workers..."
+supervisorctl reread
+supervisorctl update
+supervisorctl restart laravel-worker:*
 ```
 
 Crea `scripts/start_application.sh`:
@@ -502,6 +507,12 @@ systemctl restart php8.3-fpm
 
 echo "Reloading Nginx..."
 systemctl reload nginx
+
+echo "Ensuring Supervisor is running..."
+systemctl status supervisor || systemctl start supervisor
+
+echo "Checking queue workers..."
+supervisorctl status laravel-worker:*
 ```
 
 Crea `scripts/validate_service.sh`:
@@ -513,6 +524,15 @@ set -e
 echo "Validating application..."
 curl -f http://localhost/health || exit 1
 echo "Application is healthy!"
+
+echo "Validating queue workers..."
+WORKER_COUNT=$(supervisorctl status laravel-worker:* | grep -c "RUNNING" || echo 0)
+if [ "$WORKER_COUNT" -lt 1 ]; then
+  echo "ERROR: Queue workers not running!"
+  supervisorctl status laravel-worker:*
+  exit 1
+fi
+echo "Queue workers are healthy! ($WORKER_COUNT running)"
 ```
 
 ---
@@ -599,6 +619,15 @@ aws ssm start-session --target $INSTANCE_ID
 sudo cat /var/log/user-data.log
 sudo journalctl -u nginx -n 50
 sudo journalctl -u php8.3-fpm -n 50
+sudo journalctl -u supervisor -n 50
+
+# Ver logs de queue workers
+sudo tail -f /var/log/app/worker.log
+
+# Verificar estado de workers
+sudo supervisorctl status laravel-worker:*
+# Debe mostrar: laravel-worker:laravel-worker_00  RUNNING
+#               laravel-worker:laravel-worker_01  RUNNING
 ```
 
 ---
@@ -660,6 +689,38 @@ aws ssm start-session --target $INSTANCE_ID
 # Dentro de la instancia:
 mysql -h <rds-endpoint> -u appuser -p
 # (password está en /var/www/app/.env)
+```
+
+### Problema: Queue workers no procesan jobs
+
+**Causa:** Supervisor no corriendo o workers en estado FATAL
+**Solución:**
+```bash
+# 1. Conectarse a EC2
+aws ssm start-session --target $INSTANCE_ID
+
+# 2. Verificar estado de supervisor
+sudo systemctl status supervisor
+
+# 3. Ver estado de workers
+sudo supervisorctl status laravel-worker:*
+
+# 4. Si están STOPPED/FATAL:
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl restart laravel-worker:*
+
+# 5. Ver logs para errores
+sudo tail -f /var/log/app/worker.log
+
+# 6. Probar comando manual
+cd /var/www/app
+sudo -u www-data php artisan queue:work redis --once --verbose
+
+# Errores comunes:
+# - Redis password incorrecto (verificar REDIS_PASSWORD en .env)
+# - Permisos incorrectos en /var/www/app/storage
+# - APP_KEY no configurado
 ```
 
 ---

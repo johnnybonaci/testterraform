@@ -31,7 +31,7 @@ Este documento resume todas las mejoras aplicadas a la infraestructura Terraform
 
 ---
 
-### 2. **Composer 2.x y Node.js 20 LTS**
+### 2. **Composer 2.x, Node.js 20 LTS y Supervisor**
 
 **Agregado:**
 ```bash
@@ -42,11 +42,28 @@ curl -fsSL https://getcomposer.org/installer | php -- \
 # Node.js 20 LTS (compilar assets frontend)
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
+
+# Supervisor (Laravel Queue Workers)
+apt-get install -y supervisor
+```
+
+**Configuración Supervisor:**
+```ini
+[program:laravel-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php /var/www/app/artisan queue:work redis --sleep=3 --tries=3 --max-time=3600
+autostart=true
+autorestart=true
+user=www-data
+numprocs=2  # Prod: 2 workers, Staging: 1 worker
+stdout_logfile=/var/log/app/worker.log
 ```
 
 **Beneficios:**
 - Composer permite `composer install` en deployments de CodeDeploy
 - Node.js permite compilar Vite/Webpack assets si es necesario
+- **Supervisor mantiene los workers de Laravel corriendo 24/7**
+- **Jobs procesados automáticamente desde Redis queues**
 
 ---
 
@@ -444,6 +461,7 @@ resources = [
 | **PHP Version** | 8.2 ❌ | 8.3 ✅ | ✅ Corregido |
 | **Composer** | No instalado ❌ | 2.x instalado ✅ | ✅ Agregado |
 | **Node.js** | No instalado ❌ | 20 LTS instalado ✅ | ✅ Agregado |
+| **Supervisor** | No instalado ❌ | Instalado + 2 workers ✅ | ✅ Agregado |
 | **PHP Extensions** | Básicas | Completas (bcmath, gd, intl, zip) ✅ | ✅ Mejorado |
 | **PHP OPcache** | No configurado ❌ | Habilitado y optimizado ✅ | ✅ Agregado |
 | **Redis Password** | `null` ❌ | Token seguro en SSM ✅ | ✅ Corregido |

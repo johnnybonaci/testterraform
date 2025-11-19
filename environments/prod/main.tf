@@ -728,9 +728,28 @@ resource "aws_launch_template" "app" {
     ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
     rm -f /etc/nginx/sites-enabled/default
 
+    # Supervisor para Laravel Queue Workers
+    apt-get install -y supervisor
+
+    # Configurar worker de Laravel
+    cat > /etc/supervisor/conf.d/laravel-worker.conf <<'SUPERVISOR'
+    [program:laravel-worker]
+    process_name=%(program_name)s_%(process_num)02d
+    command=php /var/www/app/artisan queue:work redis --sleep=3 --tries=3 --max-time=3600 --timeout=60
+    autostart=true
+    autorestart=true
+    stopasgroup=true
+    killasgroup=true
+    user=www-data
+    numprocs=2
+    redirect_stderr=true
+    stdout_logfile=/var/log/app/worker.log
+    stopwaitsecs=3600
+    SUPERVISOR
+
     # Habilitar servicios
-    systemctl enable nginx php8.3-fpm
-    systemctl restart php8.3-fpm nginx
+    systemctl enable nginx php8.3-fpm supervisor
+    systemctl restart php8.3-fpm nginx supervisor
 
     # Obtener configuración desde SSM y Secrets Manager
     REGION="${var.region}"
