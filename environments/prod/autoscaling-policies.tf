@@ -15,9 +15,8 @@ resource "aws_autoscaling_policy" "target_tracking_cpu" {
 
     target_value = 70.0 # Escala cuando CPU promedio > 70%
 
-    # Configuración de cooldowns
-    scale_in_cooldown  = 300 # 5 minutos antes de scale down
-    scale_out_cooldown = 60  # 1 minuto antes de scale up (responde rápido a spikes)
+    # Nota: Target Tracking no soporta cooldowns personalizados
+    # AWS usa cooldowns por defecto (~60s scale out, ~300s scale in)
   }
 }
 

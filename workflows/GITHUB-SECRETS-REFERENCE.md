@@ -8,19 +8,19 @@ Esta guía de referencia rápida muestra EXACTAMENTE qué secrets necesitas conf
 
 ### Secrets Requeridos
 
-| Secret Name | ¿Dónde obtenerlo? | Ejemplo |
-|-------------|-------------------|---------|
-| `AWS_ROLE_ARN_FRONTEND` | `terraform output gh_front_role_arn` | `arn:aws:iam::123456789012:role/yp-test-gh-frontend-deploy` |
-| `S3_BUCKET_FRONTEND` | `terraform output frontend_bucket` | `yp-test-frontend` |
-| `CLOUDFRONT_DISTRIBUTION_ID` | `terraform output cloudfront_distribution_id` | `E1ABCDEFGHIJK` |
-| `FRONTEND_DOMAIN` | Tu dominio custom (opcional) | `yieldpro.massnexus.com` |
+| Secret Name                  | ¿Dónde obtenerlo?                             | Ejemplo                                                     |
+| ---------------------------- | --------------------------------------------- | ----------------------------------------------------------- |
+| `AWS_ROLE_ARN_FRONTEND`      | `terraform output gh_front_role_arn`          | `arn:aws:iam::123456789012:role/yp-test-gh-frontend-deploy` |
+| `S3_BUCKET_FRONTEND`         | `terraform output frontend_bucket`            | `yp-test-frontend`                                          |
+| `CLOUDFRONT_DISTRIBUTION_ID` | `terraform output cloudfront_distribution_id` | `E1ABCDEFGHIJK`                                             |
+| `FRONTEND_DOMAIN`            | Tu dominio custom (opcional)                  | `yieldpro.massnexus.com`                                    |
 
 ### Secrets Opcionales (Build-time ENV vars)
 
-| Secret Name | Propósito | Ejemplo |
-|-------------|-----------|---------|
-| `VITE_API_URL` | URL del backend API | `https://api.yieldpro.com` |
-| `VITE_APP_NAME` | Nombre de la app | `YieldPro` |
+| Secret Name     | Propósito           | Ejemplo                    |
+| --------------- | ------------------- | -------------------------- |
+| `VITE_API_URL`  | URL del backend API | `https://api.yieldpro.com` |
+| `VITE_APP_NAME` | Nombre de la app    | `YieldPro`                 |
 
 ---
 
@@ -30,12 +30,12 @@ Esta guía de referencia rápida muestra EXACTAMENTE qué secrets necesitas conf
 
 ### Secrets Requeridos
 
-| Secret Name | ¿Dónde obtenerlo? | Ejemplo |
-|-------------|-------------------|---------|
-| `AWS_ROLE_ARN_BACKEND` | `terraform output gh_backend_role_arn` | `arn:aws:iam::123456789012:role/yp-test-gh-backend-deploy` |
-| `S3_BUCKET_ARTIFACTS` | `terraform output backend_artifacts_bucket` | `yp-test-backend-artifacts` |
-| `CODEDEPLOY_APPLICATION` | `terraform output codedeploy_app_name` | `yp-test-backend` |
-| `CODEDEPLOY_DEPLOYMENT_GROUP` | `terraform output codedeploy_deployment_group` | `yp-test-backend-dg` |
+| Secret Name                   | ¿Dónde obtenerlo?                              | Ejemplo                                                    |
+| ----------------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
+| `AWS_ROLE_ARN_BACKEND`        | `terraform output gh_backend_role_arn`         | `arn:aws:iam::123456789012:role/yp-test-gh-backend-deploy` |
+| `S3_BUCKET_ARTIFACTS`         | `terraform output backend_artifacts_bucket`    | `yp-test-backend-artifacts`                                |
+| `CODEDEPLOY_APPLICATION`      | `terraform output codedeploy_app_name`         | `yp-test-backend`                                          |
+| `CODEDEPLOY_DEPLOYMENT_GROUP` | `terraform output codedeploy_deployment_group` | `yp-test-backend-dg`                                       |
 
 ---
 
@@ -128,6 +128,7 @@ CODEDEPLOY_DEPLOYMENT_GROUP = yp-test-backend-dg
 **Causa**: Secret no está configurado o tiene typo en el nombre
 
 **Solución**:
+
 1. Verificar que el nombre sea EXACTO (case-sensitive)
 2. Verificar en: https://github.com/<owner>/<repo>/settings/secrets/actions
 
@@ -136,6 +137,7 @@ CODEDEPLOY_DEPLOYMENT_GROUP = yp-test-backend-dg
 **Causa**: Copiaste el ARN incorrecto
 
 **Solución**:
+
 ```bash
 # El ARN debe tener este formato:
 arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
@@ -149,6 +151,7 @@ terraform output gh_front_role_arn
 **Causa**: Secret configurado en el repo incorrecto
 
 **Solución**:
+
 - Frontend secrets → `yieldpro_front_tmp` repo
 - Backend secrets → `yieldpro_back_tmp` repo
 - NO en el repo de Terraform

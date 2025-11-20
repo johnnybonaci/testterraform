@@ -29,6 +29,7 @@ resource "aws_sns_topic_subscription" "alerts_email" {
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/aws/ec2/${var.name}/app"
   retention_in_days = 30 # 30 días, ajustar según necesidad (7, 14, 30, 60, 90)
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
 
   tags = {
     env   = "prod"
@@ -40,6 +41,7 @@ resource "aws_cloudwatch_log_group" "app" {
 resource "aws_cloudwatch_log_group" "nginx" {
   name              = "/aws/ec2/${var.name}/nginx"
   retention_in_days = 14 # Access logs menos tiempo
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
 
   tags = {
     env   = "prod"
@@ -51,6 +53,7 @@ resource "aws_cloudwatch_log_group" "nginx" {
 resource "aws_cloudwatch_log_group" "workers" {
   name              = "/aws/ec2/${var.name}/workers"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
 
   tags = {
     env   = "prod"

@@ -235,9 +235,9 @@ resource "aws_cloudwatch_dashboard" "guardduty" {
       {
         type = "log"
         properties = {
-          query   = "SOURCE '/aws/guardduty/${var.name}' | fields @timestamp, severity, type, title | sort @timestamp desc | limit 20"
-          region  = var.region
-          title   = "Recent GuardDuty Findings"
+          query  = "SOURCE '/aws/guardduty/${var.name}' | fields @timestamp, severity, type, title | sort @timestamp desc | limit 20"
+          region = var.region
+          title  = "Recent GuardDuty Findings"
         }
       }
     ]

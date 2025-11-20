@@ -47,9 +47,9 @@ variable "allowed_ips_staging" {
   type        = list(string)
   description = "IPs permitidas para acceder a staging (equipo de desarrollo)"
   default = [
-    "181.92.77.33/32",     # IP actual Nico
-    "190.19.143.121/32",   # IP oficina 1
-    "200.123.128.225/32",  # IP oficina 2
+    "181.92.77.33/32",    # IP actual Nico
+    "190.19.143.121/32",  # IP oficina 1
+    "200.123.128.225/32", # IP oficina 2
     # Agregar más IPs del equipo aquí
   ]
 }

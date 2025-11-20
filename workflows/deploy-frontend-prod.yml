@@ -1,0 +1,102 @@
+# Deploy Frontend a Producción
+name: Deploy Frontend to Production
+
+on:
+  push:
+    branches:
+      - main # Solo deploys desde main
+
+  workflow_dispatch: # Permite deploy manual desde UI
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: "20"
+
+permissions:
+  id-token: write # Requerido para OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and Deploy to S3 + CloudFront
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Build producción
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+          # URLs principales
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_APP_URL: ${{ secrets.VITE_APP_URL }}
+
+          # Variables adicionales de Vite (configurar en GitHub Secrets según necesites)
+          VITE_OLD_SITE_URL: ${{ secrets.VITE_OLD_SITE_URL }}
+          VITE_MS_AUTH_API_URL: ${{ secrets.VITE_MS_AUTH_API_URL }}
+          VITE_APP_TIMEZONE: ${{ secrets.VITE_APP_TIMEZONE }}
+          VITE_URL: ${{ secrets.VITE_URL }}
+          VITE_API_TOKEN_YP: ${{ secrets.VITE_API_TOKEN_YP }}
+          VITE_DATE_MANAGER_TEST: ${{ secrets.VITE_DATE_MANAGER_TEST }}
+          VITE_PROVIDER: ${{ secrets.VITE_PROVIDER }}
+          VITE_XSRF_COOKIE_NAME: ${{ secrets.VITE_XSRF_COOKIE_NAME }}
+          VITE_SESSION: ${{ secrets.VITE_SESSION }}
+          VITE_MAINTENANCE_MODE1: ${{ secrets.VITE_MAINTENANCE_MODE1 }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_FRONTEND }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Frontend-Deploy
+
+      - name: Sync assets to S3 (with long cache)
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_FRONTEND }}/ \
+            --delete \
+            --exclude "*.html" \
+            --exclude "*.map" \
+            --cache-control "public,max-age=31536000,immutable"
+
+      - name: Upload HTML files (no cache)
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_FRONTEND }}/ \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "public,max-age=0,must-revalidate" \
+            --content-type "text/html"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### ✅ Frontend Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 **S3 Bucket**: \`${{ secrets.S3_BUCKET_FRONTEND }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌐 **CloudFront Distribution**: \`${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔗 **URL**: https://${{ secrets.FRONTEND_DOMAIN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🌿 **Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 📝 **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 👤 **Author**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🚀 **Cache Strategy:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Static assets (JS/CSS/images): 1 year cache" >> $GITHUB_STEP_SUMMARY
+          echo "- HTML files: No cache (always fresh)" >> $GITHUB_STEP_SUMMARY

@@ -747,7 +747,7 @@ resource "aws_autoscaling_group" "app" {
       min_healthy_percentage = 50
       instance_warmup        = 90
     }
-    # triggers = ["launch_template"]  # <-- quitar esta línea
+    triggers = ["launch_template"]
   }
 
   target_group_arns = [aws_lb_target_group.app.arn]
@@ -909,9 +909,9 @@ resource "aws_db_instance" "mysql" {
 
   backup_retention_period  = var.db_backup_days
   delete_automated_backups = true
-  skip_final_snapshot      = true  # Temporal para destroy
+  skip_final_snapshot      = true # Temporal para destroy
   # final_snapshot_identifier = "${var.name}-mysql-final-snapshot"
-  deletion_protection      = false
+  deletion_protection = false
 
   maintenance_window = "Sun:01:00-Sun:03:00"
   backup_window      = "03:00-06:00"

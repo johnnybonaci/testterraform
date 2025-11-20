@@ -152,11 +152,86 @@ output "logs_bucket_name" {
 }
 
 ########################
+# KMS Key para cifrado de CloudWatch Logs
+########################
+resource "aws_kms_key" "cloudwatch_logs" {
+  description             = "KMS key for CloudWatch Logs encryption (${var.name})"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  tags = {
+    env   = "prod"
+    stack = "yieldpro"
+    role  = "logs-encryption"
+  }
+}
+
+resource "aws_kms_alias" "cloudwatch_logs" {
+  name          = "alias/${var.name}-cloudwatch-logs"
+  target_key_id = aws_kms_key.cloudwatch_logs.key_id
+}
+
+# Policy para permitir que CloudWatch Logs y SSM usen la key
+data "aws_iam_policy_document" "cloudwatch_logs_kms" {
+  statement {
+    sid    = "Enable IAM User Permissions"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "Allow CloudWatch Logs"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${var.region}.amazonaws.com"]
+    }
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:CreateGrant",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+    # Condition removed to avoid chicken-egg problem with log group creation
+  }
+
+  statement {
+    sid    = "Allow SSM Parameters"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ssm.${var.region}.amazonaws.com"]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_kms_key_policy" "cloudwatch_logs" {
+  key_id = aws_kms_key.cloudwatch_logs.id
+  policy = data.aws_iam_policy_document.cloudwatch_logs_kms.json
+}
+
+data "aws_caller_identity" "current" {}
+
+########################
 # VPC Flow Logs a CloudWatch (prod)
 ########################
 resource "aws_cloudwatch_log_group" "vpc_fl" {
   name              = "/vpc/${var.name}"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
   tags              = { env = "prod" }
 }
 
@@ -191,7 +266,7 @@ data "aws_iam_policy_document" "vpc_fl_policy" {
 
 resource "aws_flow_log" "this" {
   log_destination_type = "cloud-watch-logs"
-  log_group_name       = aws_cloudwatch_log_group.vpc_fl.name
+  log_destination      = aws_cloudwatch_log_group.vpc_fl.arn
   iam_role_arn         = aws_iam_role.vpc_fl.arn
   traffic_type         = "ALL"
   vpc_id               = module.vpc.vpc_id
@@ -234,6 +309,10 @@ module "s3_frontend" {
   tags = { env = "prod", stack = "yieldpro", role = "frontend" }
 }
 
+########################
+# CloudFront Origin Access Control
+# ✅ STAGE 2: Descomentado - Usado por CloudFront
+########################
 resource "aws_cloudfront_origin_access_control" "frontend" {
   name                              = "${var.name}-oac"
   description                       = "OAC for ${var.name} frontend"
@@ -242,6 +321,7 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
   signing_protocol                  = "sigv4"
 }
 
+# Data sources needed by CloudFront (keep these for reference, but won't be used in Stage 1)
 data "aws_cloudfront_cache_policy" "managed_optimized" {
   name = "Managed-CachingOptimized"
 }
@@ -253,6 +333,7 @@ data "aws_cloudfront_response_headers_policy" "managed_security" {
 
 ########################
 # CloudFront (prod) con OAC
+# ✅ STAGE 2: Descomentado - Certificados validados
 ########################
 module "cloudfront" {
   source  = "terraform-aws-modules/cloudfront/aws"
@@ -340,7 +421,7 @@ resource "aws_acm_certificate" "frontend" {
   validation_method = "DNS"
 
   # CloudFront exige ACM en us-east-1
-  provider = aws # asumimos provider ya está en us-east-1 para prod
+  provider = aws.us_east_1
 
   lifecycle {
     create_before_destroy = true
@@ -359,21 +440,21 @@ resource "aws_security_group" "alb" {
   description = "ALB SG (prod)"
   vpc_id      = module.vpc.vpc_id
 
-ingress {
-  description = "HTTPS from allowed IPs"
-  from_port   = 443
-  to_port     = 443
-  protocol    = "tcp"
-  cidr_blocks = var.allowed_ips_alb
-}
+  ingress {
+    description = "HTTPS from allowed IPs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips_alb
+  }
 
-ingress {
-  description = "HTTP from allowed IPs (redirects to HTTPS)"
-  from_port   = 80
-  to_port     = 80
-  protocol    = "tcp"
-  cidr_blocks = var.allowed_ips_alb
-}
+  ingress {
+    description = "HTTP from allowed IPs (redirects to HTTPS)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips_alb
+  }
 
   egress {
     from_port        = 0
@@ -465,6 +546,7 @@ resource "aws_lb_listener" "http" {
 
 ########################
 # HTTPS listener para ALB
+# ✅ STAGE 2: Descomentado - Certificado backend validado
 ########################
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app.arn
@@ -481,6 +563,7 @@ resource "aws_lb_listener" "https" {
 
 ########################
 # Redirección 80 -> 443
+# ✅ STAGE 2: Descomentado - HTTPS listener activo
 ########################
 resource "aws_lb_listener_rule" "redirect_http_to_https" {
   listener_arn = aws_lb_listener.http.arn
@@ -898,6 +981,7 @@ output "asg_name" { value = aws_autoscaling_group.app.name }
 
 ########################
 # Bucket policy: OAC
+# ✅ STAGE 2: Descomentado - CloudFront distribution creada
 ########################
 resource "aws_s3_bucket_policy" "frontend_oac" {
   bucket = module.s3_frontend.s3_bucket_id
@@ -1020,33 +1104,38 @@ resource "random_password" "app_key" {
 }
 
 resource "aws_ssm_parameter" "app_key" {
-  name  = "/${var.name}/laravel/APP_KEY"
-  type  = "SecureString"
-  value = random_password.app_key.result
+  name   = "/${var.name}/laravel/APP_KEY"
+  type   = "SecureString"
+  value  = random_password.app_key.result
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_host" {
-  name  = "/${var.name}/laravel/DB_HOST"
-  type  = "SecureString"
-  value = aws_db_instance.mysql.address
+  name   = "/${var.name}/laravel/DB_HOST"
+  type   = "SecureString"
+  value  = aws_db_instance.mysql.address
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_name" {
-  name  = "/${var.name}/laravel/DB_NAME"
-  type  = "SecureString"
-  value = var.db_name
+  name   = "/${var.name}/laravel/DB_NAME"
+  type   = "SecureString"
+  value  = var.db_name
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_user" {
-  name  = "/${var.name}/laravel/DB_USER"
-  type  = "SecureString"
-  value = var.db_username
+  name   = "/${var.name}/laravel/DB_USER"
+  type   = "SecureString"
+  value  = var.db_username
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_secret_arn" {
-  name  = "/${var.name}/laravel/DB_SECRET_ARN"
-  type  = "SecureString"
-  value = aws_db_instance.mysql.master_user_secret[0].secret_arn
+  name   = "/${var.name}/laravel/DB_SECRET_ARN"
+  type   = "SecureString"
+  value  = aws_db_instance.mysql.master_user_secret[0].secret_arn
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 ########################
@@ -1149,19 +1238,18 @@ resource "aws_elasticache_replication_group" "redis" {
 
   # Alta disponibilidad
   automatic_failover_enabled = true # Failover automático si primary falla
-  multi_az_enabled          = true  # Distribuir replicas en diferentes AZs
+  multi_az_enabled           = true # Distribuir replicas en diferentes AZs
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
-  auth_token_enabled         = true
-  auth_token                 = random_password.redis_auth.result
+  auth_token                 = random_password.redis_auth.result # AUTH se habilita automáticamente al proporcionar auth_token
 
   security_group_ids = [aws_security_group.redis.id]
   subnet_group_name  = aws_elasticache_subnet_group.redis.name
   port               = 6379
 
   # Mantenimiento y snapshots
-  snapshot_retention_limit = 5        # Retener 5 snapshots diarios
+  snapshot_retention_limit = 5             # Retener 5 snapshots diarios
   snapshot_window          = "03:00-05:00" # Ventana de backup
   maintenance_window       = "sun:05:00-sun:07:00"
 
@@ -1176,15 +1264,17 @@ output "redis_primary_endpoint" {
 # SSM: REDIS_HOST y REDIS_PASSWORD
 ########################
 resource "aws_ssm_parameter" "redis_host" {
-  name  = "/${var.name}/laravel/REDIS_HOST"
-  type  = "SecureString"
-  value = aws_elasticache_replication_group.redis.primary_endpoint_address
+  name   = "/${var.name}/laravel/REDIS_HOST"
+  type   = "SecureString"
+  value  = aws_elasticache_replication_group.redis.primary_endpoint_address
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "redis_password" {
-  name  = "/${var.name}/laravel/REDIS_PASSWORD"
-  type  = "SecureString"
-  value = random_password.redis_auth.result
+  name   = "/${var.name}/laravel/REDIS_PASSWORD"
+  type   = "SecureString"
+  value  = random_password.redis_auth.result
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 ########################
@@ -1194,6 +1284,7 @@ output "vpc_id" { value = module.vpc.vpc_id }
 output "public_subnets" { value = module.vpc.public_subnets }
 output "private_subnets" { value = module.vpc.private_subnets }
 output "database_subnets" { value = module.vpc.database_subnets }
+# ⚠️ STAGE 2: Output comentado - CloudFront no existe aún
 output "cloudfront_domain" { value = module.cloudfront.cloudfront_distribution_domain_name }
 output "frontend_bucket" { value = module.s3_frontend.s3_bucket_id }
 
@@ -1300,6 +1391,7 @@ output "gh_front_role_arn" {
   description = "ARN del rol que asumirá GitHub Actions (frontend)"
 }
 
+# ⚠️ STAGE 2: Output  - CloudFront no existe aún
 output "cloudfront_distribution_id" {
   value       = module.cloudfront.cloudfront_distribution_id
   description = "ID de la distribución CloudFront de prod"
@@ -1320,6 +1412,33 @@ resource "aws_s3_bucket" "backend_artifacts" {
 resource "aws_s3_bucket_versioning" "backend_artifacts" {
   bucket = aws_s3_bucket.backend_artifacts.id
   versioning_configuration { status = "Enabled" }
+}
+
+# Lifecycle policy para expirar artifacts antiguos y reducir costos
+resource "aws_s3_bucket_lifecycle_configuration" "backend_artifacts" {
+  bucket = aws_s3_bucket.backend_artifacts.id
+
+  rule {
+    id     = "expire-old-artifacts"
+    status = "Enabled"
+
+    filter {}
+
+    # Eliminar artifacts después de 30 días
+    expiration {
+      days = 30
+    }
+
+    # Eliminar versiones no-current después de 7 días
+    noncurrent_version_expiration {
+      noncurrent_days = 7
+    }
+
+    # Abortar multipart uploads incompletos después de 7 días
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 # Rol de servicio que usa CodeDeploy para operar sobre el ASG
@@ -1396,7 +1515,7 @@ data "aws_iam_policy_document" "gh_back_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [
+      values = [
         "repo:beatsmedia/yieldpro_back_tmp:*"
       ]
     }
