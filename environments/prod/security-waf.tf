@@ -4,8 +4,9 @@
 ########################
 
 resource "aws_wafv2_web_acl" "cloudfront" {
-  name  = "${var.name}-cloudfront-waf"
-  scope = "CLOUDFRONT"
+  name     = "${var.name}-cloudfront-waf"
+  scope    = "CLOUDFRONT"
+  provider = aws.us_east_1
 
   default_action {
     allow {}
@@ -147,7 +148,7 @@ resource "aws_wafv2_web_acl" "cloudfront" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "waf-cloudfront"
   }
 }
@@ -172,7 +173,7 @@ resource "aws_wafv2_web_acl" "alb" {
     action {
       block {
         custom_response {
-          response_code = 429
+          response_code            = 429
           custom_response_body_key = "rate_limit_body"
         }
       }
@@ -318,8 +319,8 @@ resource "aws_wafv2_web_acl" "alb" {
 
   # Custom response para rate limiting
   custom_response_body {
-    key          = "rate_limit_body"
-    content      = jsonencode({
+    key = "rate_limit_body"
+    content = jsonencode({
       error = "Too many requests. Please try again later."
     })
     content_type = "APPLICATION_JSON"
@@ -333,7 +334,7 @@ resource "aws_wafv2_web_acl" "alb" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "waf-alb"
   }
 }

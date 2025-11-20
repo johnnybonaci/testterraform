@@ -213,6 +213,21 @@ module "cloudfront" {
     response_headers_policy_id = data.aws_cloudfront_response_headers_policy.managed_security.id
   }
 
+  custom_error_response = [
+    {
+      error_code            = 404
+      response_code         = 200
+      response_page_path    = "/index.html"
+      error_caching_min_ttl = 0
+    },
+    {
+      error_code            = 403
+      response_code         = 200
+      response_page_path    = "/index.html"
+      error_caching_min_ttl = 0
+    }
+  ]
+
   viewer_certificate = {
     cloudfront_default_certificate = true
   }
@@ -318,13 +333,17 @@ resource "aws_lb_target_group" "app" {
 
   health_check {
     enabled             = true
+    port                = "traffic-port"
+    protocol            = "HTTP"
     path                = "/health"
-    matcher             = "200"
+    matcher             = "200-399"
     healthy_threshold   = 2
     unhealthy_threshold = 2
     interval            = 30
     timeout             = 5
   }
+
+  deregistration_delay = 15
 
   tags = {
     env   = "staging"
@@ -458,69 +477,199 @@ resource "aws_launch_template" "app" {
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
 
+    # Log de inicio
+    echo "[$(date)] Starting EC2 bootstrap for Laravel 12 / PHP 8.3" | tee -a /var/log/user-data.log
+
+    # Paquetes base
     apt-get update -y
-    apt-get install -y nginx software-properties-common unzip jq awscli
+    apt-get install -y nginx software-properties-common unzip jq curl wget git ca-certificates
+
+    # AWS CLI v2
+    if ! command -v aws &>/dev/null; then
+      cd /tmp
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+      unzip -q awscliv2.zip
+      ./aws/install
+      rm -rf aws awscliv2.zip
+    fi
+
+    # PHP 8.3 + extensiones para Laravel 12
     add-apt-repository ppa:ondrej/php -y
     apt-get update -y
-    apt-get install -y php8.2 php8.2-fpm php8.2-cli php8.2-mysql php8.2-xml php8.2-curl php8.2-mbstring php8.2-redis
+    apt-get install -y \
+      php8.3 \
+      php8.3-fpm \
+      php8.3-cli \
+      php8.3-mysql \
+      php8.3-pgsql \
+      php8.3-xml \
+      php8.3-curl \
+      php8.3-mbstring \
+      php8.3-zip \
+      php8.3-bcmath \
+      php8.3-gd \
+      php8.3-intl \
+      php8.3-redis \
+      php8.3-opcache
 
+    # Composer 2.x
+    if ! command -v composer &>/dev/null; then
+      curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer --2
+      chmod +x /usr/local/bin/composer
+    fi
+
+    # Node.js 20 LTS
+    if ! command -v node &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+    fi
+
+    # Directorios de la aplicación
     mkdir -p /var/www/app /var/log/app
 
-    # Nginx vhost simple para Laravel/public
+    # Configuración PHP-FPM optimizada
+    cat > /etc/php/8.3/fpm/pool.d/www.conf <<'PHPFPM'
+    [www]
+    user = www-data
+    group = www-data
+    listen = /run/php/php8.3-fpm.sock
+    listen.owner = www-data
+    listen.group = www-data
+    listen.mode = 0660
+
+    pm = dynamic
+    pm.max_children = 30
+    pm.start_servers = 3
+    pm.min_spare_servers = 2
+    pm.max_spare_servers = 10
+    pm.max_requests = 500
+
+    php_admin_value[error_log] = /var/log/php8.3-fpm.log
+    php_admin_flag[log_errors] = on
+    php_value[session.save_handler] = files
+    php_value[session.save_path] = /var/lib/php/sessions
+    PHPFPM
+
+    # Optimizaciones PHP para Laravel
+    cat > /etc/php/8.3/fpm/conf.d/99-laravel.ini <<'PHPINI'
+    memory_limit = 256M
+    upload_max_filesize = 64M
+    post_max_size = 64M
+    max_execution_time = 300
+    max_input_time = 300
+    opcache.enable=1
+    opcache.memory_consumption=128
+    opcache.interned_strings_buffer=8
+    opcache.max_accelerated_files=10000
+    opcache.revalidate_freq=2
+    opcache.fast_shutdown=1
+    PHPINI
+
+    # Nginx vhost para Laravel
     cat >/etc/nginx/sites-available/app <<'NGINX'
     server {
       listen 80 default_server;
       server_name _;
-
       root /var/www/app/public;
       index index.php index.html;
 
-      location /health { return 200 'ok'; add_header Content-Type text/plain; }
+      client_max_body_size 64M;
 
+      # Health check endpoint
+      location /health {
+        access_log off;
+        return 200 'ok';
+        add_header Content-Type text/plain;
+      }
+
+      # Laravel routes
       location / {
         try_files $uri $uri/ /index.php?$query_string;
       }
 
+      # PHP-FPM
       location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+      }
+
+      # Deny access to hidden files
+      location ~ /\. {
+        deny all;
       }
     }
     NGINX
 
     ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
     rm -f /etc/nginx/sites-enabled/default
-    systemctl enable --now nginx php8.2-fpm
 
+    # Supervisor para Laravel Queue Workers
+    apt-get install -y supervisor
+
+    # Configurar worker de Laravel
+    cat > /etc/supervisor/conf.d/laravel-worker.conf <<'SUPERVISOR'
+    [program:laravel-worker]
+    process_name=%(program_name)s_%(process_num)02d
+    command=php /var/www/app/artisan queue:work redis --sleep=3 --tries=3 --max-time=3600 --timeout=60
+    autostart=true
+    autorestart=true
+    stopasgroup=true
+    killasgroup=true
+    user=www-data
+    numprocs=1
+    redirect_stderr=true
+    stdout_logfile=/var/log/app/worker.log
+    stopwaitsecs=3600
+    SUPERVISOR
+
+    # Habilitar servicios
+    systemctl enable nginx php8.3-fpm supervisor
+    systemctl restart php8.3-fpm nginx supervisor
+
+    # Obtener configuración desde SSM y Secrets Manager
     REGION="${var.region}"
     PREFIX="/${var.name}/laravel/"
 
-    # Obtener parámetros de SSM
     get_ssm () {
-      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" | jq -r .Parameter.Value
+      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" 2>/dev/null | jq -r .Parameter.Value || echo ""
     }
 
-    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY" || echo "")
+    echo "[$(date)] Fetching configuration from SSM/Secrets Manager..." | tee -a /var/log/user-data.log
+
+    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY")
     DB_HOST=$(get_ssm "$${PREFIX}DB_HOST")
     DB_NAME=$(get_ssm "$${PREFIX}DB_NAME")
     DB_USER=$(get_ssm "$${PREFIX}DB_USER")
     DB_SECRET_ARN=$(get_ssm "$${PREFIX}DB_SECRET_ARN")
     REDIS_HOST=$(get_ssm "$${PREFIX}REDIS_HOST")
+    REDIS_PASSWORD=$(get_ssm "$${PREFIX}REDIS_PASSWORD")
 
-    # Obtener password desde Secrets Manager (JSON con username/password)
+    if [ -z "$DB_SECRET_ARN" ]; then
+      echo "[ERROR] DB_SECRET_ARN not found in SSM" | tee -a /var/log/user-data.log
+      exit 1
+    fi
+
     DB_PASS=$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ARN" --region "$REGION" \
       | jq -r '.SecretString | fromjson | .password')
 
-    # .env mínimo (placeholder)
+    # Generar .env de Laravel
     cat > /var/www/app/.env <<ENV
     APP_NAME=Laravel
-    APP_ENV=production
+    APP_ENV=staging
     APP_KEY=$${APP_KEY}
-    APP_DEBUG=false
+    APP_DEBUG=true
     APP_URL=http://localhost
 
-    LOG_CHANNEL=single
-    LOG_LEVEL=info
+    LOG_CHANNEL=stack
+    LOG_LEVEL=debug
 
     DB_CONNECTION=mysql
     DB_HOST=$${DB_HOST}
@@ -529,21 +678,36 @@ resource "aws_launch_template" "app" {
     DB_USERNAME=$${DB_USER}
     DB_PASSWORD=$${DB_PASS}
 
+    BROADCAST_DRIVER=log
     CACHE_DRIVER=redis
+    FILESYSTEM_DISK=local
     QUEUE_CONNECTION=redis
-    REDIS_HOST=$${REDIS_HOST}
-    REDIS_PORT=6379
-    ENV
-    chown -R www-data:www-data /var/www/app
+    SESSION_DRIVER=redis
 
-    # Placeholder app/public para responder algo
+    REDIS_HOST=$${REDIS_HOST}
+    REDIS_PASSWORD=$${REDIS_PASSWORD}
+    REDIS_PORT=6379
+
+    AWS_DEFAULT_REGION=${var.region}
+    AWS_BUCKET=${var.name}-storage
+    ENV
+
+    # Placeholder inicial
     mkdir -p /var/www/app/public
     cat >/var/www/app/public/index.php <<'PHP'
     <?php
-    echo "Laravel placeholder running";
+    phpinfo();
+    echo "\n\n<!-- Laravel 12 / PHP 8.3 Ready (staging) -->";
     PHP
 
+    # Permisos
+    chown -R www-data:www-data /var/www/app
+    chmod -R 755 /var/www/app
+    chmod -R 775 /var/www/app/storage 2>/dev/null || true
+    chmod -R 775 /var/www/app/bootstrap/cache 2>/dev/null || true
+
     systemctl reload nginx
+    echo "[$(date)] Bootstrap completed successfully" | tee -a /var/log/user-data.log
   EOF
   )
 
@@ -583,7 +747,7 @@ resource "aws_autoscaling_group" "app" {
       min_healthy_percentage = 50
       instance_warmup        = 90
     }
-    # triggers = ["launch_template"]  # <-- quitar esta línea
+    triggers = ["launch_template"]
   }
 
   target_group_arns = [aws_lb_target_group.app.arn]
@@ -667,21 +831,28 @@ resource "aws_elasticache_subnet_group" "redis" {
 }
 
 ########################
-# Redis 7 - 1 nodo, cifrado
+# Redis 7 - 1 nodo, cifrado + AUTH
 ########################
+resource "random_password" "redis_auth" {
+  length  = 32
+  special = false # Redis AUTH no soporta caracteres especiales
+}
+
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id       = "${var.name}-redis"
   description                = "Redis for ${var.name}"
   engine                     = "redis"
   engine_version             = "7.0"
   parameter_group_name       = "default.redis7"
-  node_type                  = "cache.t4g.micro" # suficiente para staging
+  node_type                  = "cache.t4g.micro" # Suficiente para staging
   num_cache_clusters         = 1
   multi_az_enabled           = false
   automatic_failover_enabled = false
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
+  auth_token_enabled         = true
+  auth_token                 = random_password.redis_auth.result
 
   subnet_group_name  = aws_elasticache_subnet_group.redis.name
   security_group_ids = [aws_security_group.redis.id]
@@ -738,8 +909,9 @@ resource "aws_db_instance" "mysql" {
 
   backup_retention_period  = var.db_backup_days
   delete_automated_backups = true
-  skip_final_snapshot      = false
-  deletion_protection      = false
+  skip_final_snapshot      = true # Temporal para destroy
+  # final_snapshot_identifier = "${var.name}-mysql-final-snapshot"
+  deletion_protection = false
 
   maintenance_window = "Sun:01:00-Sun:03:00"
   backup_window      = "03:00-06:00"
@@ -759,12 +931,18 @@ output "rds_endpoint" {
 }
 
 ########################
-# SSM: REDIS_HOST
+# SSM: REDIS_HOST y REDIS_PASSWORD
 ########################
 resource "aws_ssm_parameter" "redis_host" {
   name  = "/${var.name}/laravel/REDIS_HOST"
   type  = "SecureString"
   value = aws_elasticache_replication_group.redis.primary_endpoint_address
+}
+
+resource "aws_ssm_parameter" "redis_password" {
+  name  = "/${var.name}/laravel/REDIS_PASSWORD"
+  type  = "SecureString"
+  value = random_password.redis_auth.result
 }
 
 ########################

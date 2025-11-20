@@ -31,9 +31,9 @@ module "vpc" {
     cidrsubnet(var.vpc_cidr, 5, 21)
   ]
 
-  enable_nat_gateway     = false
+  enable_nat_gateway     = var.enable_nat_gateway
   single_nat_gateway     = false
-  one_nat_gateway_per_az = false
+  one_nat_gateway_per_az = var.enable_nat_gateway # Solo si está habilitado
 
   enable_dns_hostnames = true
   enable_dns_support   = true
@@ -43,7 +43,7 @@ module "vpc" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -142,7 +142,7 @@ module "logs_bucket" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "logs"
   }
 }
@@ -152,11 +152,86 @@ output "logs_bucket_name" {
 }
 
 ########################
+# KMS Key para cifrado de CloudWatch Logs
+########################
+resource "aws_kms_key" "cloudwatch_logs" {
+  description             = "KMS key for CloudWatch Logs encryption (${var.name})"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  tags = {
+    env   = "prod"
+    stack = "yieldpro"
+    role  = "logs-encryption"
+  }
+}
+
+resource "aws_kms_alias" "cloudwatch_logs" {
+  name          = "alias/${var.name}-cloudwatch-logs"
+  target_key_id = aws_kms_key.cloudwatch_logs.key_id
+}
+
+# Policy para permitir que CloudWatch Logs y SSM usen la key
+data "aws_iam_policy_document" "cloudwatch_logs_kms" {
+  statement {
+    sid    = "Enable IAM User Permissions"
+    effect = "Allow"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "Allow CloudWatch Logs"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${var.region}.amazonaws.com"]
+    }
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:CreateGrant",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+    # Condition removed to avoid chicken-egg problem with log group creation
+  }
+
+  statement {
+    sid    = "Allow SSM Parameters"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ssm.${var.region}.amazonaws.com"]
+    }
+    actions = [
+      "kms:Decrypt",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_kms_key_policy" "cloudwatch_logs" {
+  key_id = aws_kms_key.cloudwatch_logs.id
+  policy = data.aws_iam_policy_document.cloudwatch_logs_kms.json
+}
+
+data "aws_caller_identity" "current" {}
+
+########################
 # VPC Flow Logs a CloudWatch (prod)
 ########################
 resource "aws_cloudwatch_log_group" "vpc_fl" {
   name              = "/vpc/${var.name}"
   retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
   tags              = { env = "prod" }
 }
 
@@ -191,7 +266,7 @@ data "aws_iam_policy_document" "vpc_fl_policy" {
 
 resource "aws_flow_log" "this" {
   log_destination_type = "cloud-watch-logs"
-  log_group_name       = aws_cloudwatch_log_group.vpc_fl.name
+  log_destination      = aws_cloudwatch_log_group.vpc_fl.arn
   iam_role_arn         = aws_iam_role.vpc_fl.arn
   traffic_type         = "ALL"
   vpc_id               = module.vpc.vpc_id
@@ -231,9 +306,13 @@ module "s3_frontend" {
     target_prefix = "s3-frontend/"
   }
 
-  tags = { env = "prod", stack = "massnexus", role = "frontend" }
+  tags = { env = "prod", stack = "yieldpro", role = "frontend" }
 }
 
+########################
+# CloudFront Origin Access Control
+# ✅ STAGE 2: Descomentado - Usado por CloudFront
+########################
 resource "aws_cloudfront_origin_access_control" "frontend" {
   name                              = "${var.name}-oac"
   description                       = "OAC for ${var.name} frontend"
@@ -242,13 +321,19 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
   signing_protocol                  = "sigv4"
 }
 
+# Data sources needed by CloudFront (keep these for reference, but won't be used in Stage 1)
 data "aws_cloudfront_cache_policy" "managed_optimized" {
   name = "Managed-CachingOptimized"
+}
+
+data "aws_cloudfront_response_headers_policy" "managed_security" {
+  name = "Managed-SecurityHeadersPolicy"
 }
 
 
 ########################
 # CloudFront (prod) con OAC
+# ✅ STAGE 2: Descomentado - Certificados validados
 ########################
 module "cloudfront" {
   source  = "terraform-aws-modules/cloudfront/aws"
@@ -282,13 +367,14 @@ module "cloudfront" {
   }
 
   default_cache_behavior = {
-    target_origin_id       = "s3-origin"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    compress               = true
-    cache_policy_id        = data.aws_cloudfront_cache_policy.managed_optimized.id
-    use_forwarded_values   = false
+    target_origin_id           = "s3-origin"
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = true
+    cache_policy_id            = data.aws_cloudfront_cache_policy.managed_optimized.id
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.managed_security.id
+    use_forwarded_values       = false
   }
 
   # WAF asociado (desde security-waf.tf)
@@ -324,7 +410,7 @@ module "cloudfront" {
     include_cookies = false
   }
 
-  tags = { env = "prod", stack = "massnexus", role = "cdn" }
+  tags = { env = "prod", stack = "yieldpro", role = "cdn" }
 }
 
 ########################
@@ -335,7 +421,7 @@ resource "aws_acm_certificate" "frontend" {
   validation_method = "DNS"
 
   # CloudFront exige ACM en us-east-1
-  provider = aws # asumimos provider ya está en us-east-1 para prod
+  provider = aws.us_east_1
 
   lifecycle {
     create_before_destroy = true
@@ -354,27 +440,21 @@ resource "aws_security_group" "alb" {
   description = "ALB SG (prod)"
   vpc_id      = module.vpc.vpc_id
 
-ingress {
-  description = "HTTPS from allowed IP only"
-  from_port   = 443
-  to_port     = 443
-  protocol    = "tcp"
-  cidr_blocks = [
-    "200.123.128.225/32",
-    "190.19.143.121/32", # si querés mantener la vieja por ahora
-  ]
-}
+  ingress {
+    description = "HTTPS from allowed IPs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips_alb
+  }
 
-ingress {
-  description = "HTTP from allowed IP only"
-  from_port   = 80
-  to_port     = 80
-  protocol    = "tcp"
-  cidr_blocks = [
-    "200.123.128.225/32",
-    "190.19.143.121/32",
-  ]
-}
+  ingress {
+    description = "HTTP from allowed IPs (redirects to HTTPS)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_ips_alb
+  }
 
   egress {
     from_port        = 0
@@ -426,7 +506,7 @@ resource "aws_lb" "app" {
 
   enable_deletion_protection = false
 
-  tags = { env = "prod", stack = "massnexus", role = "alb" }
+  tags = { env = "prod", stack = "yieldpro", role = "alb" }
 }
 
 resource "aws_lb_target_group" "app" {
@@ -450,7 +530,7 @@ resource "aws_lb_target_group" "app" {
 
   deregistration_delay = 15
 
-  tags = { env = "prod", stack = "massnexus", role = "alb-tg" }
+  tags = { env = "prod", stack = "yieldpro", role = "alb-tg" }
 }
 
 resource "aws_lb_listener" "http" {
@@ -466,13 +546,14 @@ resource "aws_lb_listener" "http" {
 
 ########################
 # HTTPS listener para ALB
+# ✅ STAGE 2: Descomentado - Certificado backend validado
 ########################
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.app.arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = "arn:aws:acm:us-east-1:838108223027:certificate/76a7501d-f39c-4b68-8a66-f4db5fde1925"
+  certificate_arn   = aws_acm_certificate.backend.arn
 
   default_action {
     type             = "forward"
@@ -482,6 +563,7 @@ resource "aws_lb_listener" "https" {
 
 ########################
 # Redirección 80 -> 443
+# ✅ STAGE 2: Descomentado - HTTPS listener activo
 ########################
 resource "aws_lb_listener_rule" "redirect_http_to_https" {
   listener_arn = aws_lb_listener.http.arn
@@ -529,45 +611,9 @@ output "backend_cert_validation_records" {
 }
 
 ########################
-# ACM (opcional) para el ALB
+# Certificado ACM ya está definido arriba como aws_acm_certificate.backend
+# No necesitamos duplicados
 ########################
-
-# 1) Solicitud del certificado (si hay dominio)
-resource "aws_acm_certificate" "alb" {
-  count                     = var.backend_domain_name != "" ? 1 : 0
-  domain_name               = var.backend_domain_name
-  validation_method         = "DNS"
-  subject_alternative_names = []
-
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  tags = { env = "prod", role = "alb-cert" }
-}
-
-# 2) (Opcional) Validación automática si usás Route53
-resource "aws_route53_record" "alb_cert_validation" {
-  count   = var.backend_domain_name != "" && var.backend_domain_zone_id != "" ? 1 : 0
-  zone_id = var.backend_domain_zone_id
-
-  name    = one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_name
-  type    = one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_type
-  records = [one(aws_acm_certificate.alb[0].domain_validation_options).resource_record_value]
-  ttl     = 60
-}
-
-resource "aws_acm_certificate_validation" "alb" {
-  count           = 0
-  certificate_arn = aws_acm_certificate.alb[0].arn
-  # validation_record_fqdns = var.backend_domain_zone_id != "" ? [aws_route53_record.alb_cert_validation[0].fqdn] : []
-}
-
-# Output útil (queda vacío si no seteaste dominio)
-output "alb_certificate_arn" {
-  value       = try(aws_acm_certificate_validation.alb[0].certificate_arn, "")
-  description = "ARN del cert ACM validado para el ALB (si se configuró dominio)."
-}
 
 
 ########################
@@ -617,13 +663,13 @@ data "aws_ami" "ubuntu" {
 resource "aws_launch_template" "app" {
   name_prefix   = "${var.name}-lt-"
   image_id      = data.aws_ami.ubuntu.id
-  instance_type = "t3.medium"
+  instance_type = "c6i.large" # 2 vCPU dedicados, 4GB RAM - mejor performance que t3
 
   iam_instance_profile { name = aws_iam_instance_profile.ec2_profile.name }
 
   network_interfaces {
     security_groups             = [aws_security_group.app.id]
-    associate_public_ip_address = true # TEMPORAL hasta tener NAT
+    associate_public_ip_address = !var.use_private_subnets_for_ec2 # Solo si está en subnets públicas
   }
 
   user_data = base64encode(<<-EOF
@@ -631,15 +677,95 @@ resource "aws_launch_template" "app" {
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
 
+    # Log de inicio
+    echo "[$(date)] Starting EC2 bootstrap for Laravel 12 / PHP 8.3" | tee -a /var/log/user-data.log
+
+    # Paquetes base
     apt-get update -y
-    apt-get install -y nginx software-properties-common unzip jq awscli
+    apt-get install -y nginx software-properties-common unzip jq curl wget git ca-certificates
+
+    # AWS CLI v2 (más reciente y mejor performance)
+    if ! command -v aws &>/dev/null; then
+      cd /tmp
+      curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+      unzip -q awscliv2.zip
+      ./aws/install
+      rm -rf aws awscliv2.zip
+    fi
+
+    # PHP 8.3 + extensiones para Laravel 12
     add-apt-repository ppa:ondrej/php -y
     apt-get update -y
-    apt-get install -y php8.2 php8.2-fpm php8.2-cli php8.2-mysql php8.2-xml php8.2-curl php8.2-mbstring php8.2-redis
+    apt-get install -y \
+      php8.3 \
+      php8.3-fpm \
+      php8.3-cli \
+      php8.3-mysql \
+      php8.3-pgsql \
+      php8.3-xml \
+      php8.3-curl \
+      php8.3-mbstring \
+      php8.3-zip \
+      php8.3-bcmath \
+      php8.3-gd \
+      php8.3-intl \
+      php8.3-redis \
+      php8.3-opcache
 
+    # Composer 2.x
+    if ! command -v composer &>/dev/null; then
+      curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer --2
+      chmod +x /usr/local/bin/composer
+    fi
+
+    # Node.js 20 LTS (para compilar assets si es necesario)
+    if ! command -v node &>/dev/null; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y nodejs
+    fi
+
+    # Directorios de la aplicación
     mkdir -p /var/www/app /var/log/app
 
-    # Nginx vhost
+    # Configuración PHP-FPM optimizada para producción
+    cat > /etc/php/8.3/fpm/pool.d/www.conf <<'PHPFPM'
+    [www]
+    user = www-data
+    group = www-data
+    listen = /run/php/php8.3-fpm.sock
+    listen.owner = www-data
+    listen.group = www-data
+    listen.mode = 0660
+
+    pm = dynamic
+    pm.max_children = 50
+    pm.start_servers = 5
+    pm.min_spare_servers = 5
+    pm.max_spare_servers = 35
+    pm.max_requests = 500
+
+    php_admin_value[error_log] = /var/log/php8.3-fpm.log
+    php_admin_flag[log_errors] = on
+    php_value[session.save_handler] = files
+    php_value[session.save_path] = /var/lib/php/sessions
+    PHPFPM
+
+    # Optimizaciones PHP para Laravel (php.ini)
+    cat > /etc/php/8.3/fpm/conf.d/99-laravel.ini <<'PHPINI'
+    memory_limit = 256M
+    upload_max_filesize = 64M
+    post_max_size = 64M
+    max_execution_time = 300
+    max_input_time = 300
+    opcache.enable=1
+    opcache.memory_consumption=128
+    opcache.interned_strings_buffer=8
+    opcache.max_accelerated_files=10000
+    opcache.revalidate_freq=2
+    opcache.fast_shutdown=1
+    PHPINI
+
+    # Nginx vhost para Laravel
     cat >/etc/nginx/sites-available/app <<'NGINX'
     server {
       listen 80 default_server;
@@ -647,71 +773,116 @@ resource "aws_launch_template" "app" {
       root /var/www/app/public;
       index index.php index.html;
 
-      location /health { return 200 'ok'; add_header Content-Type text/plain; }
+      client_max_body_size 64M;
 
+      # Health check endpoint (no pasa por Laravel)
+      location /health {
+        access_log off;
+        return 200 'ok';
+        add_header Content-Type text/plain;
+      }
+
+      # Laravel routes
       location / {
         try_files $uri $uri/ /index.php?$query_string;
       }
 
+      # PHP-FPM
       location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_intercept_errors off;
+        fastcgi_buffer_size 16k;
+        fastcgi_buffers 4 16k;
+        fastcgi_connect_timeout 300;
+        fastcgi_send_timeout 300;
+        fastcgi_read_timeout 300;
+      }
+
+      # Deny access to hidden files
+      location ~ /\. {
+        deny all;
       }
     }
     NGINX
 
     ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
     rm -f /etc/nginx/sites-enabled/default
-    systemctl enable --now nginx php8.2-fpm
 
+    # Supervisor para Laravel Queue Workers
+    apt-get install -y supervisor
+
+    # Configurar worker de Laravel
+    cat > /etc/supervisor/conf.d/laravel-worker.conf <<'SUPERVISOR'
+    [program:laravel-worker]
+    process_name=%(program_name)s_%(process_num)02d
+    command=php /var/www/app/artisan queue:work redis --sleep=3 --tries=3 --max-time=3600 --timeout=60
+    autostart=true
+    autorestart=true
+    stopasgroup=true
+    killasgroup=true
+    user=www-data
+    numprocs=2
+    redirect_stderr=true
+    stdout_logfile=/var/log/app/worker.log
+    stopwaitsecs=3600
+    SUPERVISOR
+
+    # Habilitar servicios
+    systemctl enable nginx php8.3-fpm supervisor
+    systemctl restart php8.3-fpm nginx supervisor
+
+    # Obtener configuración desde SSM y Secrets Manager
     REGION="${var.region}"
     PREFIX="/${var.name}/laravel/"
 
     get_ssm () {
-      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" | jq -r .Parameter.Value
+      aws ssm get-parameter --with-decryption --name "$1" --region "$REGION" 2>/dev/null | jq -r .Parameter.Value || echo ""
     }
 
-    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY" || echo "")
+    echo "[$(date)] Fetching configuration from SSM/Secrets Manager..." | tee -a /var/log/user-data.log
+
+    APP_KEY=$(get_ssm "$${PREFIX}APP_KEY")
     DB_HOST=$(get_ssm "$${PREFIX}DB_HOST")
     DB_NAME=$(get_ssm "$${PREFIX}DB_NAME")
     DB_USER=$(get_ssm "$${PREFIX}DB_USER")
     DB_SECRET_ARN=$(get_ssm "$${PREFIX}DB_SECRET_ARN")
     REDIS_HOST=$(get_ssm "$${PREFIX}REDIS_HOST")
+    REDIS_PASSWORD=$(get_ssm "$${PREFIX}REDIS_PASSWORD")
+
+    if [ -z "$DB_SECRET_ARN" ]; then
+      echo "[ERROR] DB_SECRET_ARN not found in SSM" | tee -a /var/log/user-data.log
+      exit 1
+    fi
 
     DB_PASS=$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ARN" --region "$REGION" \
       | jq -r '.SecretString | fromjson | .password')
 
-
-    ##############################
     # CodeDeploy Agent (Ubuntu 22.04)
-    ##############################
     if ! systemctl is-active --quiet codedeploy-agent; then
-      echo "[codedeploy] installing agent..."
-      apt-get update -y
-      # ruby es requerido por el agente clásico
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ruby wget
+      echo "[$(date)] Installing CodeDeploy agent..." | tee -a /var/log/user-data.log
+      apt-get install -y ruby-full wget
       cd /tmp
-      # instalador oficial para us-east-1
-      wget -q https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install -O install_codedeploy
+      wget -q https://aws-codedeploy-${var.region}.s3.${var.region}.amazonaws.com/latest/install -O install_codedeploy
       chmod +x install_codedeploy
-      ./install_codedeploy auto || ./install_codedeploy auto
+      ./install_codedeploy auto
       systemctl enable codedeploy-agent
-      systemctl restart codedeploy-agent
-      echo "[codedeploy] agent installed"
-    else
-      echo "[codedeploy] agent already running"
-    fi 
+      systemctl start codedeploy-agent
+      echo "[$(date)] CodeDeploy agent installed" | tee -a /var/log/user-data.log
+    fi
 
-    # .env mínimo
+    # Generar .env de Laravel
     cat > /var/www/app/.env <<ENV
     APP_NAME=Laravel
     APP_ENV=production
     APP_KEY=$${APP_KEY}
     APP_DEBUG=false
-    APP_URL=http://localhost
+    APP_URL=https://${var.backend_domain_name}
 
-    LOG_CHANNEL=single
-    LOG_LEVEL=info
+    LOG_CHANNEL=stack
+    LOG_LEVEL=error
 
     DB_CONNECTION=mysql
     DB_HOST=$${DB_HOST}
@@ -720,20 +891,36 @@ resource "aws_launch_template" "app" {
     DB_USERNAME=$${DB_USER}
     DB_PASSWORD=$${DB_PASS}
 
+    BROADCAST_DRIVER=log
     CACHE_DRIVER=redis
+    FILESYSTEM_DISK=local
     QUEUE_CONNECTION=redis
+    SESSION_DRIVER=redis
+
     REDIS_HOST=$${REDIS_HOST}
+    REDIS_PASSWORD=$${REDIS_PASSWORD}
     REDIS_PORT=6379
+
+    AWS_DEFAULT_REGION=${var.region}
+    AWS_BUCKET=${var.name}-storage
     ENV
 
+    # Placeholder inicial (será reemplazado por CodeDeploy)
     mkdir -p /var/www/app/public
     cat >/var/www/app/public/index.php <<'PHP'
     <?php
-    echo "Laravel placeholder running (prod)";
+    phpinfo();
+    echo "\n\n<!-- Laravel 12 / PHP 8.3 Ready (prod) -->";
     PHP
 
+    # Permisos
     chown -R www-data:www-data /var/www/app
+    chmod -R 755 /var/www/app
+    chmod -R 775 /var/www/app/storage 2>/dev/null || true
+    chmod -R 775 /var/www/app/bootstrap/cache 2>/dev/null || true
+
     systemctl reload nginx
+    echo "[$(date)] Bootstrap completed successfully" | tee -a /var/log/user-data.log
   EOF
   )
 
@@ -746,14 +933,14 @@ resource "aws_launch_template" "app" {
 }
 
 ########################
-# Auto Scaling Group
+# Auto Scaling Group - Alta disponibilidad con mínimo 2 instancias
 ########################
 resource "aws_autoscaling_group" "app" {
   name                      = "${var.name}-asg"
-  max_size                  = 2
-  min_size                  = 1
-  desired_capacity          = 1
-  vpc_zone_identifier       = module.vpc.public_subnets
+  max_size                  = 4 # Escala hasta 4 instancias bajo carga
+  min_size                  = 2 # Siempre 2 instancias corriendo (HA)
+  desired_capacity          = 2 # Iniciar con 2 instancias en diferentes AZs
+  vpc_zone_identifier       = var.use_private_subnets_for_ec2 ? module.vpc.private_subnets : module.vpc.public_subnets
   health_check_type         = "ELB"
   health_check_grace_period = 300
 
@@ -768,10 +955,21 @@ resource "aws_autoscaling_group" "app" {
     value               = "${var.name}-app"
     propagate_at_launch = true
   }
+  tag {
+    key                 = "env"
+    value               = "prod"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "stack"
+    value               = "massnexus"
+    propagate_at_launch = true
+  }
+
   instance_refresh {
     strategy = "Rolling"
     preferences {
-      min_healthy_percentage = 50
+      min_healthy_percentage = 50 # Siempre mantiene al menos 1 instancia healthy durante updates
       instance_warmup        = 60
     }
   }
@@ -783,6 +981,7 @@ output "asg_name" { value = aws_autoscaling_group.app.name }
 
 ########################
 # Bucket policy: OAC
+# ✅ STAGE 2: Descomentado - CloudFront distribution creada
 ########################
 resource "aws_s3_bucket_policy" "frontend_oac" {
   bucket = module.s3_frontend.s3_bucket_id
@@ -887,7 +1086,7 @@ resource "aws_db_instance" "mysql" {
 
   performance_insights_enabled = true
 
-  tags = { env = "prod", stack = "massnexus", role = "rds" }
+  tags = { env = "prod", stack = "yieldpro", role = "rds" }
 }
 
 output "rds_endpoint" {
@@ -905,33 +1104,38 @@ resource "random_password" "app_key" {
 }
 
 resource "aws_ssm_parameter" "app_key" {
-  name  = "/${var.name}/laravel/APP_KEY"
-  type  = "SecureString"
-  value = random_password.app_key.result
+  name   = "/${var.name}/laravel/APP_KEY"
+  type   = "SecureString"
+  value  = random_password.app_key.result
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_host" {
-  name  = "/${var.name}/laravel/DB_HOST"
-  type  = "SecureString"
-  value = aws_db_instance.mysql.address
+  name   = "/${var.name}/laravel/DB_HOST"
+  type   = "SecureString"
+  value  = aws_db_instance.mysql.address
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_name" {
-  name  = "/${var.name}/laravel/DB_NAME"
-  type  = "SecureString"
-  value = var.db_name
+  name   = "/${var.name}/laravel/DB_NAME"
+  type   = "SecureString"
+  value  = var.db_name
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_user" {
-  name  = "/${var.name}/laravel/DB_USER"
-  type  = "SecureString"
-  value = var.db_username
+  name   = "/${var.name}/laravel/DB_USER"
+  type   = "SecureString"
+  value  = var.db_username
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 resource "aws_ssm_parameter" "db_secret_arn" {
-  name  = "/${var.name}/laravel/DB_SECRET_ARN"
-  type  = "SecureString"
-  value = aws_db_instance.mysql.master_user_secret[0].secret_arn
+  name   = "/${var.name}/laravel/DB_SECRET_ARN"
+  type   = "SecureString"
+  value  = aws_db_instance.mysql.master_user_secret[0].secret_arn
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 ########################
@@ -1015,26 +1219,41 @@ resource "aws_elasticache_subnet_group" "redis" {
 }
 
 ########################
-# Redis 7 - 1 nodo, cifrado
+# Redis 7 - Multi-AZ con failover automático, cifrado + AUTH
 ########################
+resource "random_password" "redis_auth" {
+  length  = 32
+  special = false # Redis AUTH no soporta caracteres especiales
+}
+
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id = "${var.name}-redis"
-  description          = "Redis for ${var.name} (prod)"
+  description          = "Redis for ${var.name} (prod) - Multi-AZ HA"
 
   engine               = "redis"
   engine_version       = "7.0"
   parameter_group_name = "default.redis7"
-  node_type            = "cache.t4g.micro" # ajustá cuando crezca
-  num_cache_clusters   = 1                 # single node en prod inicial
+  node_type            = "cache.t4g.small" # 1.37GB - capacidad adecuada para sessions + cache + queues
+  num_cache_clusters   = 3                 # 1 primary + 2 replicas en diferentes AZs
+
+  # Alta disponibilidad
+  automatic_failover_enabled = true # Failover automático si primary falla
+  multi_az_enabled           = true # Distribuir replicas en diferentes AZs
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
+  auth_token                 = random_password.redis_auth.result # AUTH se habilita automáticamente al proporcionar auth_token
 
   security_group_ids = [aws_security_group.redis.id]
   subnet_group_name  = aws_elasticache_subnet_group.redis.name
   port               = 6379
 
-  tags = { env = "prod", stack = "massnexus", role = "redis" }
+  # Mantenimiento y snapshots
+  snapshot_retention_limit = 5             # Retener 5 snapshots diarios
+  snapshot_window          = "03:00-05:00" # Ventana de backup
+  maintenance_window       = "sun:05:00-sun:07:00"
+
+  tags = { env = "prod", stack = "yieldpro", role = "redis-ha" }
 }
 
 output "redis_primary_endpoint" {
@@ -1042,12 +1261,20 @@ output "redis_primary_endpoint" {
 }
 
 ########################
-# SSM: REDIS_HOST
+# SSM: REDIS_HOST y REDIS_PASSWORD
 ########################
 resource "aws_ssm_parameter" "redis_host" {
-  name  = "/${var.name}/laravel/REDIS_HOST"
-  type  = "SecureString"
-  value = aws_elasticache_replication_group.redis.primary_endpoint_address
+  name   = "/${var.name}/laravel/REDIS_HOST"
+  type   = "SecureString"
+  value  = aws_elasticache_replication_group.redis.primary_endpoint_address
+  key_id = aws_kms_key.cloudwatch_logs.id
+}
+
+resource "aws_ssm_parameter" "redis_password" {
+  name   = "/${var.name}/laravel/REDIS_PASSWORD"
+  type   = "SecureString"
+  value  = random_password.redis_auth.result
+  key_id = aws_kms_key.cloudwatch_logs.id
 }
 
 ########################
@@ -1057,6 +1284,7 @@ output "vpc_id" { value = module.vpc.vpc_id }
 output "public_subnets" { value = module.vpc.public_subnets }
 output "private_subnets" { value = module.vpc.private_subnets }
 output "database_subnets" { value = module.vpc.database_subnets }
+# ⚠️ STAGE 2: Output comentado - CloudFront no existe aún
 output "cloudfront_domain" { value = module.cloudfront.cloudfront_distribution_domain_name }
 output "frontend_bucket" { value = module.s3_frontend.s3_bucket_id }
 
@@ -1163,6 +1391,7 @@ output "gh_front_role_arn" {
   description = "ARN del rol que asumirá GitHub Actions (frontend)"
 }
 
+# ⚠️ STAGE 2: Output  - CloudFront no existe aún
 output "cloudfront_distribution_id" {
   value       = module.cloudfront.cloudfront_distribution_id
   description = "ID de la distribución CloudFront de prod"
@@ -1183,6 +1412,33 @@ resource "aws_s3_bucket" "backend_artifacts" {
 resource "aws_s3_bucket_versioning" "backend_artifacts" {
   bucket = aws_s3_bucket.backend_artifacts.id
   versioning_configuration { status = "Enabled" }
+}
+
+# Lifecycle policy para expirar artifacts antiguos y reducir costos
+resource "aws_s3_bucket_lifecycle_configuration" "backend_artifacts" {
+  bucket = aws_s3_bucket.backend_artifacts.id
+
+  rule {
+    id     = "expire-old-artifacts"
+    status = "Enabled"
+
+    filter {}
+
+    # Eliminar artifacts después de 30 días
+    expiration {
+      days = 30
+    }
+
+    # Eliminar versiones no-current después de 7 días
+    noncurrent_version_expiration {
+      noncurrent_days = 7
+    }
+
+    # Abortar multipart uploads incompletos después de 7 días
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 # Rol de servicio que usa CodeDeploy para operar sobre el ASG
@@ -1259,7 +1515,7 @@ data "aws_iam_policy_document" "gh_back_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [
+      values = [
         "repo:beatsmedia/yieldpro_back_tmp:*"
       ]
     }
@@ -1291,8 +1547,8 @@ data "aws_iam_policy_document" "gh_backend_policy" {
       "s3:HeadObject"
     ]
     resources = [
-      "arn:aws:s3:::massnexus-prd-backend-artifacts",
-      "arn:aws:s3:::massnexus-prd-backend-artifacts/*"
+      aws_s3_bucket.backend_artifacts.arn,
+      "${aws_s3_bucket.backend_artifacts.arn}/*"
     ]
   }
 

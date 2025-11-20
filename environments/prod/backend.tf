@@ -1,9 +1,9 @@
 terraform {
   backend "s3" {
-    bucket         = "massnexus-tf-state-nico" # tu bucket de state
+    bucket         = "yp-test-tf-state" # Bucket de state remoto (creado en bootstrap)
     region         = "us-east-1"
-    key            = "prod/terraform.tfstate" # <- distinto a staging
-    dynamodb_table = "tf-locks-massnexus"
+    key            = "prod/terraform.tfstate" # State file de prod
+    dynamodb_table = "tf-locks-yp-test"       # Tabla de locks (creada en bootstrap)
     encrypt        = true
   }
 }

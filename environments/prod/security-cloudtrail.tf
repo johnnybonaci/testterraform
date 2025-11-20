@@ -9,7 +9,7 @@ resource "aws_s3_bucket" "cloudtrail" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "cloudtrail"
   }
 }
@@ -141,7 +141,7 @@ resource "aws_cloudtrail" "main" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "audit"
   }
 }
@@ -156,7 +156,7 @@ resource "aws_cloudwatch_log_group" "cloudtrail" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 

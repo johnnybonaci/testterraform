@@ -31,7 +31,7 @@ resource "aws_guardduty_detector" "main" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
     role  = "threat-detection"
   }
 }
@@ -47,7 +47,7 @@ resource "aws_sns_topic" "guardduty_alerts" {
 
   tags = {
     env   = "prod"
-    stack = "massnexus"
+    stack = "yieldpro"
   }
 }
 
@@ -235,9 +235,9 @@ resource "aws_cloudwatch_dashboard" "guardduty" {
       {
         type = "log"
         properties = {
-          query   = "SOURCE '/aws/guardduty/${var.name}' | fields @timestamp, severity, type, title | sort @timestamp desc | limit 20"
-          region  = var.region
-          title   = "Recent GuardDuty Findings"
+          query  = "SOURCE '/aws/guardduty/${var.name}' | fields @timestamp, severity, type, title | sort @timestamp desc | limit 20"
+          region = var.region
+          title  = "Recent GuardDuty Findings"
         }
       }
     ]

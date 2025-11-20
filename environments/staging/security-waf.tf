@@ -18,7 +18,7 @@ resource "aws_wafv2_web_acl" "cloudfront" {
     action {
       block {
         custom_response {
-          response_code = 403
+          response_code            = 403
           custom_response_body_key = "ip_blocked"
         }
       }
@@ -116,8 +116,8 @@ resource "aws_wafv2_web_acl" "cloudfront" {
 
   # Custom response bodies
   custom_response_body {
-    key          = "ip_blocked"
-    content      = jsonencode({
+    key = "ip_blocked"
+    content = jsonencode({
       error = "Access denied. Your IP is not whitelisted for staging environment."
     })
     content_type = "APPLICATION_JSON"
